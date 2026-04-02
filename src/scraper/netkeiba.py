@@ -63,6 +63,11 @@ class NetkeibaScraper:
 
             # race_id 構造: YYYY(4) + 競馬場(2) + 回次(2) + 日次(2) + レース番号(2)
             course_code = race_id[4:6]
+
+            # JRA(中央)のみ: 場コード 01-10。それ以外は地方競馬なのでスキップ
+            if course_code not in COURSE_CODES:
+                continue
+
             race_number = int(race_id[10:12])
 
             races.append({
