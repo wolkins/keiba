@@ -1,0 +1,107 @@
+{% extends "base.html" %}
+{% block title %}{{ race.venue }} {{ race.race_number }}R - 競馬予想{% endblock %}
+{% block content %}
+
+<div style="margin-bottom: 1rem;">
+  <a href="/races?d={{ race.date }}">&larr; {{ race.date }} のレース一覧</a>
+</div>
+
+<div class="card">
+  <div style="display: flex; align-items: center; gap: 1rem; flex-wrap: wrap;">
+    <h2 style="font-size: 1.2rem; color: var(--text); margin: 0;">
+      {{ race.venue }} {{ race.race_number }}R
+      {% if race.race_name %} {{ race.race_name }}{% endif %}
+    </h2>
+    {% if race.grade %}
+    <span class="badge badge-{{ race.grade|lower|replace(' ','') }}">{{ race.grade }}</span>
+    {% endif %}
+    <span class="badge badge-{{ race.status }}">{{ race.status }}</span>
+    {% if race.surface %}
+    <span class="surface-{{ 'turf' if race.surface == '芝' else 'dirt' }}" style="font-size: 0.85rem;">
+      {{ race.surface }}{{ race.distance }}m {{ race.course_type }}
+    </span>
+    {% endif %}
+    {% if race.weather %}
+    <span style="color: var(--text-dim); font-size: 0.85rem;">{{ race.weather }}</span>
+    {% endif %}
+    {% if race.track_condition %}
+    <span style="color: var(--text-dim); font-size: 0.85rem;">{{ race.track_condition }}</span>
+    {% endif %}
+    {% if race.n_runners %}
+    <span style="color: var(--text-dim); font-size: 0.85rem;">{{ race.n_runners }}頭</span>
+    {% endif %}
+  </div>
+</div>
+
+<!-- 出走表 -->
+<div class="card">
+  <h2>出走表</h2>
+  <div style="overflow-x: auto;">
+  <table>
+    <thead>
+      <tr>
+        <th class="text-center">枠</th>
+        <th class="text-center">馬番</th>
+        <th>馬名</th>
+        <th>騎手</th>
+        <th class="text-right">斤量</th>
+        <th class="text-right">馬体重</th>
+        <th class="text-right">上がり3F</th>
+        {% if race.status == "finished" %}
+        <th class="text-center">着</th>
+        <th class="text-right">タイム</th>
+        <th class="text-right">着差</th>
+        {% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for e in entries %}
+      <tr{% if e.finish_position == 1 %} style="background: rgba(251, 191, 36, 0.1);"{% endif %}>
+        <td class="text-center">
+          {% if e.frame_number %}
+          <span class="frame-num frame-{{ e.frame_number }}">{{ e.frame_number }}</span>
+          {% else %}-{% endif %}
+        </td>
+        <td class="text-center" style="font-weight: bold; font-size: 1.1rem;">{{ e.horse_number }}</td>
+        <td>{{ e.horse_name }}</td>
+        <td>{{ e.jockey_name }}</td>
+        <td class="text-right">{{ "%.1f"|format(e.weight_carry) if e.weight_carry else "-" }}</td>
+        <td class="text-right">
+          {% if e.horse_weight %}
+            {{ e.horse_weight }}{% if e.weight_diff is not none %}(<span style="color: {% if e.weight_diff > 0 %}var(--red){% elif e.weight_diff < 0 %}var(--accent){% else %}var(--text-dim){% endif %};">{% if e.weight_diff > 0 %}+{% endif %}{{ e.weight_diff }}</span>){% endif %}
+          {% else %}-{% endif %}
+        </td>
+        <td class="text-right">{{ "%.1f"|format(e.last_3f) if e.last_3f else "-" }}</td>
+        {% if race.status == "finished" %}
+        <td class="text-center" style="font-weight: bold;{% if e.finish_position == 1 %} color: var(--yellow);{% elif e.finish_position and e.finish_position <= 3 %} color: var(--accent);{% endif %}">
+          {{ e.finish_position or "-" }}
+        </td>
+        <td class="text-right">{{ e.finish_time or "-" }}</td>
+        <td class="text-right">{{ e.margin or "-" }}</td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</div>
+
+<!-- 予測 -->
+<div class="card">
+  <div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 0.75rem;">
+    <h2 style="margin: 0;">予測</h2>
+    <a class="btn {% if mode == 'accuracy' %}active{% endif %}"
+       hx-get="/predict/{{ race.id }}?mode=accuracy" hx-target="#prediction-area" hx-swap="innerHTML">
+      的中率重視
+    </a>
+    <a class="btn {% if mode == 'roi' %}active{% endif %}"
+       hx-get="/predict/{{ race.id }}?mode=roi" hx-target="#prediction-area" hx-swap="innerHTML">
+      回収率重視
+    </a>
+  </div>
+  <div id="prediction-area">
+    {% include "_predictions.html" %}
+  </div>
+</div>
+
+{% endblock %}
