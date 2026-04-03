@@ -3,6 +3,7 @@
 使用例:
     python -m src.cli scrape --date 2026-04-01
     python -m src.cli scrape-range --from 2025-04-01 --to 2026-03-31
+    python -m src.cli check-data --from 2024-04-01 --to 2025-03-31
     python -m src.cli predict --date 2026-04-01
     python -m src.cli train
     python -m src.cli status
@@ -341,6 +342,124 @@ def evaluate(folds: int, gap_days: int):
     console.print()
 
     session.close()
+
+
+@cli.command("check-data")
+@click.option("--from", "date_from", required=True, help="開始日 (YYYY-MM-DD)")
+@click.option("--to", "date_to", default=None, help="終了日 (YYYY-MM-DD) デフォルト: 今日")
+def check_data(date_from: str, date_to: str | None):
+    """期間内の不完全データを検出"""
+    from sqlalchemy import func
+
+    start = datetime.strptime(date_from, "%Y-%m-%d").date()
+    end = datetime.strptime(date_to, "%Y-%m-%d").date() if date_to else date.today()
+
+    session = get_session()
+
+    try:
+        # 日別の統計を一括取得
+        stats = (
+            session.query(
+                Race.race_date,
+                func.count(Race.id).label("race_count"),
+                func.sum(
+                    func.coalesce(
+                        session.query(func.count(RaceEntry.id))
+                        .filter(RaceEntry.race_id == Race.id)
+                        .correlate(Race)
+                        .scalar_subquery(), 0
+                    )
+                ).label("entry_count"),
+                func.sum(
+                    func.coalesce(
+                        session.query(func.count(RaceEntry.id))
+                        .filter(RaceEntry.race_id == Race.id, RaceEntry.finish_position.isnot(None))
+                        .correlate(Race)
+                        .scalar_subquery(), 0
+                    )
+                ).label("result_count"),
+            )
+            .filter(Race.race_date >= start, Race.race_date <= end)
+            .group_by(Race.race_date)
+            .order_by(Race.race_date)
+            .all()
+        )
+
+        stats_by_date = {row.race_date: row for row in stats}
+
+        # 不完全な日を検出
+        incomplete = []
+        missing = []
+        current = start
+        while current <= end:
+            if current in stats_by_date:
+                row = stats_by_date[current]
+                has_no_entry_races = session.query(Race).filter(
+                    Race.race_date == current,
+                    ~Race.entries.any(),
+                ).count()
+                has_no_result_races = session.query(Race).filter(
+                    Race.race_date == current,
+                    Race.entries.any(),
+                    ~Race.entries.any(RaceEntry.finish_position.isnot(None)),
+                ).count()
+                if has_no_entry_races > 0 or has_no_result_races > 0:
+                    incomplete.append({
+                        "date": current,
+                        "races": row.race_count,
+                        "entries": row.entry_count,
+                        "results": row.result_count,
+                        "no_entry": has_no_entry_races,
+                        "no_result": has_no_result_races,
+                    })
+            else:
+                missing.append(current)
+            current += timedelta(days=1)
+
+        # 結果表示
+        console.print(f"\n[bold blue]データ整合性チェック: {date_from} → {end.isoformat()}[/bold blue]\n")
+        console.print(f"  DB登録日数: {len(stats_by_date)} / チェック対象: {(end - start).days + 1}日\n")
+
+        if not incomplete and not missing:
+            console.print("[green]問題なし！ すべての日のデータが完全です。[/green]\n")
+        else:
+            if incomplete:
+                table = Table(title="不完全なデータがある日", show_header=True, header_style="bold yellow")
+                table.add_column("日付", width=12)
+                table.add_column("レース数", justify="right", width=8)
+                table.add_column("エントリー", justify="right", width=10)
+                table.add_column("結果", justify="right", width=8)
+                table.add_column("出走表なし", justify="right", width=10)
+                table.add_column("結果なし", justify="right", width=8)
+                for row in incomplete:
+                    table.add_row(
+                        row["date"].isoformat(),
+                        str(row["races"]),
+                        str(row["entries"]),
+                        str(row["results"]),
+                        f"[red]{row['no_entry']}[/red]" if row["no_entry"] else "0",
+                        f"[red]{row['no_result']}[/red]" if row["no_result"] else "0",
+                    )
+                console.print(table)
+                console.print()
+
+            if missing:
+                console.print(f"[yellow]データが存在しない日: {len(missing)}日[/yellow]")
+                console.print("  ※開催のない日も含まれます")
+                for d in missing:
+                    console.print(f"  {d.isoformat()}")
+                console.print()
+
+            # 再取得コマンド
+            rescrape_dates = [row["date"] for row in incomplete]
+            if rescrape_dates:
+                console.print("[bold]再取得コマンド (不完全な日):[/bold]")
+                for d in rescrape_dates:
+                    console.print(f"  python -m src.cli scrape --date {d.isoformat()}")
+                console.print()
+
+    finally:
+        session.close()
 
 
 @cli.command()
