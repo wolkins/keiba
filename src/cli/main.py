@@ -126,7 +126,7 @@ def scrape_range(date_from: str, date_to: str | None):
                 if not race_list:
                     console.print(f"  [dim]開催なし[/dim]")
                     current += timedelta(days=1)
-                    continue
+                    continue  # DAY_PAUSEなしで次へ
 
                 console.print(f"  {len(race_list)}レース検出")
 
@@ -284,6 +284,61 @@ def train(min_races: int):
             console.print(f"  [bold]1着的中率: {result['top1_accuracy']:.1%}[/bold]")
         if "top3_exact" in result:
             console.print(f"  [bold]3着完全一致: {result['top3_exact']:.1%}[/bold]")
+
+    session.close()
+
+
+@cli.command()
+@click.option("--folds", default=4, type=int, help="CV fold数")
+@click.option("--gap-days", default=7, type=int, help="学習/検証間ギャップ日数")
+def evaluate(folds: int, gap_days: int):
+    """ウォークフォワードCVでモデルを評価"""
+    from src.predictor.evaluation import walk_forward_cv
+
+    session = get_session()
+    console.print(f"\n[bold blue]ウォークフォワードCV ({folds} fold, gap={gap_days}日)[/bold blue]\n")
+
+    with console.status("評価中... (数分かかる場合があります)"):
+        result = walk_forward_cv(session, n_splits=folds, gap_days=gap_days)
+
+    if "error" in result:
+        console.print(f"[red]{result['error']}[/red]")
+        session.close()
+        return
+
+    # Fold別結果
+    table = Table(title="Fold別結果", show_header=True, header_style="bold cyan")
+    table.add_column("Fold", justify="center", width=6)
+    table.add_column("NDCG@3", justify="right", width=8)
+    table.add_column("MRR", justify="right", width=8)
+    table.add_column("1着的中", justify="right", width=8)
+    table.add_column("3着完全", justify="right", width=8)
+    table.add_column("ROI", justify="right", width=8)
+    table.add_column("評価R数", justify="right", width=8)
+
+    for f in result["fold_results"]:
+        table.add_row(
+            str(f["fold"]),
+            f"{f['ndcg3']:.4f}",
+            f"{f['mrr']:.4f}",
+            f"{f['top1_hit_rate']:.1%}",
+            f"{f['top3_exact_rate']:.1%}",
+            f"{f['roi_simulation']:.2f}",
+            str(f["n_eval_races"]),
+        )
+
+    console.print(table)
+
+    # 平均
+    mean = result["mean"]
+    std = result["std"]
+    console.print(f"\n[bold green]平均 ({result['n_folds']} fold):[/bold green]")
+    console.print(f"  NDCG@3:    {mean.get('ndcg3', 0):.4f} ± {std.get('ndcg3', 0):.4f}")
+    console.print(f"  MRR:       {mean.get('mrr', 0):.4f} ± {std.get('mrr', 0):.4f}")
+    console.print(f"  1着的中率: {mean.get('top1_hit_rate', 0):.1%} ± {std.get('top1_hit_rate', 0):.1%}")
+    console.print(f"  3着完全:   {mean.get('top3_exact_rate', 0):.1%} ± {std.get('top3_exact_rate', 0):.1%}")
+    console.print(f"  ROI:       {mean.get('roi_simulation', 0):.2f} ± {std.get('roi_simulation', 0):.2f}")
+    console.print()
 
     session.close()
 
