@@ -658,23 +658,43 @@ def _calc_speed_features(history: list[tuple[RaceEntry, Race]]) -> dict:
     return features
 
 
+_winner_time_cache: dict[int, float | None] = {}
+_winner_cache_computed = False
+
+
+def _precompute_winner_times(session: Session, before_date):
+    """全レースの勝ち馬タイムを事前にキャッシュ"""
+    global _winner_time_cache, _winner_cache_computed
+    if _winner_cache_computed:
+        return
+
+    winners = (
+        session.query(RaceEntry.race_id, RaceEntry.finish_time)
+        .join(Race, RaceEntry.race_id == Race.id)
+        .filter(
+            RaceEntry.finish_position == 1,
+            RaceEntry.finish_time.isnot(None),
+            Race.race_date < before_date,
+        )
+        .all()
+    )
+
+    for race_id, finish_time in winners:
+        _winner_time_cache[race_id] = _time_to_seconds(finish_time)
+
+    _winner_cache_computed = True
+
+
 def _calc_margin_features(session: Session, history: list[tuple[RaceEntry, Race]]) -> dict:
-    """勝ち馬とのタイム差"""
+    """勝ち馬とのタイム差(キャッシュ版)"""
     margins = []
     for e, r in history[:5]:
         my_time = _time_to_seconds(e.finish_time)
         if not my_time:
             continue
-        # 同レースの1着馬のタイムを取得
-        winner = (
-            session.query(RaceEntry)
-            .filter_by(race_id=r.id, finish_position=1)
-            .first()
-        )
-        if winner:
-            winner_time = _time_to_seconds(winner.finish_time)
-            if winner_time:
-                margins.append(my_time - winner_time)
+        winner_time = _winner_time_cache.get(r.id)
+        if winner_time:
+            margins.append(my_time - winner_time)
 
     return {
         "margin_to_winner_avg": float(np.mean(margins)) if margins else 0.0,
@@ -682,85 +702,89 @@ def _calc_margin_features(session: Session, history: list[tuple[RaceEntry, Race]
 
 
 # =============================================================
-# 厩舎特徴量
+# 厩舎特徴量 (キャッシュ版)
 # =============================================================
+
+_trainer_stats_cache: dict[str, tuple[float, float]] = {}
+_trainer_jockey_cache: dict[tuple[str, int], float] = {}
+_trainer_cache_computed = False
+
+
+def _precompute_trainer_stats(session: Session, before_date):
+    """全厩舎の成績を事前に一括計算"""
+    global _trainer_stats_cache, _trainer_jockey_cache, _trainer_cache_computed
+    if _trainer_cache_computed:
+        return
+
+    from collections import defaultdict
+
+    results = (
+        session.query(
+            Horse.trainer,
+            RaceEntry.finish_position,
+            RaceEntry.jockey_id,
+        )
+        .join(Horse, RaceEntry.horse_id == Horse.id)
+        .join(Race, RaceEntry.race_id == Race.id)
+        .filter(
+            RaceEntry.finish_position.isnot(None),
+            Horse.trainer.isnot(None),
+            Race.race_date < before_date,
+        )
+        .all()
+    )
+
+    trainer_positions = defaultdict(list)
+    combo_positions = defaultdict(list)
+
+    for trainer, finish_pos, jockey_id in results:
+        trainer = (trainer or "").strip()
+        if not trainer:
+            continue
+        trainer_positions[trainer].append(finish_pos)
+        if jockey_id:
+            combo_positions[(trainer, jockey_id)].append(finish_pos)
+
+    for trainer, positions in trainer_positions.items():
+        win_rate = sum(1 for p in positions if p == 1) / len(positions)
+        top3_rate = sum(1 for p in positions if p <= 3) / len(positions)
+        _trainer_stats_cache[trainer] = (win_rate, top3_rate)
+
+    for key, positions in combo_positions.items():
+        _trainer_jockey_cache[key] = sum(1 for p in positions if p == 1) / len(positions)
+
+    _trainer_cache_computed = True
+
 
 def _calc_trainer_features(horse: Horse | None, race: Race,
                            session: Session) -> dict:
-    """厩舎成績・騎手×厩舎コンビ"""
+    """厩舎成績(キャッシュから取得)"""
     features = {
         "trainer_win_rate": 0.0,
         "trainer_top3_rate": 0.0,
-        "jockey_trainer_combo_win": 0.0,
     }
 
     if not horse or not horse.trainer:
         return features
 
     trainer_name = horse.trainer.strip()
-    if not trainer_name:
-        return features
-
-    # 厩舎の過去成績(同厩舎の馬のエントリーを集計)
-    trainer_horses = (
-        session.query(Horse.id)
-        .filter(Horse.trainer == trainer_name)
-        .scalar_subquery()
-    )
-
-    trainer_entries = (
-        session.query(RaceEntry)
-        .join(Race, RaceEntry.race_id == Race.id)
-        .filter(
-            RaceEntry.horse_id.in_(trainer_horses),
-            RaceEntry.finish_position.isnot(None),
-            Race.race_date < race.race_date,
-        )
-        .limit(200)
-        .all()
-    )
-
-    if trainer_entries:
-        positions = [e.finish_position for e in trainer_entries if e.finish_position]
-        if positions:
-            features["trainer_win_rate"] = sum(1 for p in positions if p == 1) / len(positions)
-            features["trainer_top3_rate"] = sum(1 for p in positions if p <= 3) / len(positions)
+    stats = _trainer_stats_cache.get(trainer_name)
+    if stats:
+        features["trainer_win_rate"] = stats[0]
+        features["trainer_top3_rate"] = stats[1]
 
     return features
 
 
 def _calc_jockey_trainer_combo(entry: RaceEntry, horse: Horse | None,
                                 race: Race, session: Session) -> dict:
-    """騎手×厩舎コンビの勝率"""
+    """騎手×厩舎コンビの勝率(キャッシュから取得)"""
     if not horse or not horse.trainer or not entry.jockey_id:
         return {"jockey_trainer_combo_win": 0.0}
 
     trainer_name = horse.trainer.strip()
-    trainer_horses = (
-        session.query(Horse.id)
-        .filter(Horse.trainer == trainer_name)
-        .subquery()
-    )
-
-    combo_entries = (
-        session.query(RaceEntry)
-        .join(Race, RaceEntry.race_id == Race.id)
-        .filter(
-            RaceEntry.horse_id.in_(trainer_horses),
-            RaceEntry.jockey_id == entry.jockey_id,
-            RaceEntry.finish_position.isnot(None),
-            Race.race_date < race.race_date,
-        )
-        .limit(50)
-        .all()
-    )
-
-    if combo_entries:
-        positions = [e.finish_position for e in combo_entries if e.finish_position]
-        if positions:
-            return {"jockey_trainer_combo_win": sum(1 for p in positions if p == 1) / len(positions)}
-
-    return {"jockey_trainer_combo_win": 0.0}
+    combo_rate = _trainer_jockey_cache.get((trainer_name, entry.jockey_id), 0.0)
+    return {"jockey_trainer_combo_win": combo_rate}
 
 
 # =============================================================
@@ -814,7 +838,7 @@ _elo_computed = False
 
 
 def _compute_elo_ratings(session: Session, before_race: Race):
-    """全馬のEloレーティングを計算(当該レース前まで)"""
+    """全馬のEloレーティングを計算(当該レース前まで) - 一括プリロード版"""
     global _elo_cache, _elo_computed
     if _elo_computed:
         return
@@ -822,42 +846,54 @@ def _compute_elo_ratings(session: Session, before_race: Race):
     K = 16  # Elo K-factor
     _elo_cache.clear()
 
-    # 全確定レースを日付順で取得
-    races = (
-        session.query(Race)
+    # 全確定レースのIDを日付順で取得
+    race_ids = (
+        session.query(Race.id)
         .filter(Race.status == "finished", Race.race_date < before_race.race_date)
         .order_by(Race.race_date, Race.id)
         .all()
     )
+    race_id_list = [r[0] for r in race_ids]
 
-    for race in races:
-        entries = (
-            session.query(RaceEntry)
-            .filter(
-                RaceEntry.race_id == race.id,
-                RaceEntry.finish_position.isnot(None),
-                RaceEntry.horse_id.isnot(None),
-            )
-            .all()
+    if not race_id_list:
+        _elo_computed = True
+        return
+
+    # 全エントリーを一括取得してレースごとにグループ化
+    all_entries = (
+        session.query(RaceEntry.race_id, RaceEntry.horse_id, RaceEntry.finish_position)
+        .filter(
+            RaceEntry.race_id.in_(race_id_list),
+            RaceEntry.finish_position.isnot(None),
+            RaceEntry.horse_id.isnot(None),
         )
+        .all()
+    )
+
+    # レースIDごとにグループ化
+    from collections import defaultdict
+    race_entries_map = defaultdict(list)
+    for race_id, horse_id, finish_pos in all_entries:
+        race_entries_map[race_id].append((horse_id, finish_pos))
+
+    for race_id in race_id_list:
+        entries = race_entries_map.get(race_id, [])
         if len(entries) < 2:
             continue
 
-        # 各馬のElo更新
-        ratings = {e.horse_id: _elo_cache.get(e.horse_id, 1500.0) for e in entries}
+        ratings = {hid: _elo_cache.get(hid, 1500.0) for hid, _ in entries}
         n = len(entries)
         new_ratings = {}
 
-        for e in entries:
-            hid = e.horse_id
+        for hid, fp in entries:
             r_self = ratings[hid]
             delta = 0.0
-            for e2 in entries:
-                if e2.horse_id == hid:
+            for hid2, fp2 in entries:
+                if hid2 == hid:
                     continue
-                r_opp = ratings[e2.horse_id]
+                r_opp = ratings[hid2]
                 expected = 1.0 / (1.0 + 10 ** ((r_opp - r_self) / 400))
-                actual = 1.0 if e.finish_position < e2.finish_position else (0.5 if e.finish_position == e2.finish_position else 0.0)
+                actual = 1.0 if fp < fp2 else (0.5 if fp == fp2 else 0.0)
                 delta += K * (actual - expected) / (n - 1)
             new_ratings[hid] = r_self + delta
 
@@ -935,10 +971,14 @@ def _calc_interaction_features(f: dict) -> dict:
 
 def build_features_for_race(session: Session, race: Race) -> pd.DataFrame:
     """レースの全エントリーから特徴量DataFrameを生成"""
-    # Elo計算は重いので予測時のみ(学習時はキャッシュで対応)
-    global _elo_computed
+    # 事前キャッシュ計算(初回のみ)
+    global _elo_computed, _trainer_cache_computed, _winner_cache_computed
     if not _elo_computed:
         _compute_elo_ratings(session, race)
+    if not _trainer_cache_computed:
+        _precompute_trainer_stats(session, race.race_date)
+    if not _winner_cache_computed:
+        _precompute_winner_times(session, race.race_date)
 
     entries = session.query(RaceEntry).filter_by(race_id=race.id).all()
     racecourse = session.query(Racecourse).filter_by(id=race.racecourse_id).first()
