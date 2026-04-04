@@ -5,3 +5,4 @@ data/*.db
 data/models/
 *.egg-info/
 .DS_Store
+.env
