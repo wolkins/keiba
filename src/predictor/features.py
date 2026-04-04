@@ -560,6 +560,349 @@ def _distance_category(distance: int) -> int:
 
 
 # =============================================================
+# ローテーション・間隔
+# =============================================================
+
+def _calc_rotation_features(race: Race, history: list[tuple[RaceEntry, Race]]) -> dict:
+    """前走間隔・休み明け・距離変更"""
+    features = {
+        "days_since_last": 60.0,  # デフォルト=休み明け相当
+        "rest_bucket": 3,  # 0=連闘, 1=中1-2週, 2=中3-8週, 3=休み明け
+        "is_fresh": 0,  # 休み明けフラグ(中10週以上)
+        "is_second_up": 0,  # 叩き2走目フラグ
+        "distance_change": 0,  # 前走比距離増減(m)
+        "surface_switch": 0,  # 芝ダ替わりフラグ
+    }
+
+    if not history:
+        return features
+
+    prev_entry, prev_race = history[0]
+    if race.race_date and prev_race.race_date:
+        days = (race.race_date - prev_race.race_date).days
+        features["days_since_last"] = float(days)
+        if days <= 8:
+            features["rest_bucket"] = 0
+        elif days <= 21:
+            features["rest_bucket"] = 1
+        elif days <= 63:
+            features["rest_bucket"] = 2
+        else:
+            features["rest_bucket"] = 3
+            features["is_fresh"] = 1
+
+    # 叩き2走目判定
+    if len(history) >= 2:
+        prev2_entry, prev2_race = history[1]
+        if prev_race.race_date and prev2_race.race_date:
+            gap_before = (prev_race.race_date - prev2_race.race_date).days
+            if gap_before > 70:  # 前走が休み明けだった
+                features["is_second_up"] = 1
+
+    # 距離変更
+    if race.distance and prev_race.distance:
+        features["distance_change"] = race.distance - prev_race.distance
+
+    # 芝ダ替わり
+    cur_surface = (race.surface or "").strip()
+    prev_surface = (prev_race.surface or "").strip()
+    if cur_surface and prev_surface and cur_surface != prev_surface:
+        features["surface_switch"] = 1
+
+    return features
+
+
+# =============================================================
+# スピード指数
+# =============================================================
+
+def _calc_speed_features(history: list[tuple[RaceEntry, Race]]) -> dict:
+    """走破タイムベースのスピード指数"""
+    features = {
+        "speed_figure_last": 0.0,
+        "speed_figure_best3": 0.0,
+        "speed_figure_avg3": 0.0,
+        "margin_to_winner_avg": 0.0,  # 勝ち馬とのタイム差平均
+        "finish_std": 0.0,  # 着順安定性
+    }
+
+    if not history:
+        return features
+
+    # スピード指数: 距離・馬場補正した標準化タイム
+    # 基準: 芝2000m良=120秒, ダート1800m良=112秒 として偏差値化
+    speed_figs = []
+    for e, r in history:
+        t = _time_to_seconds(e.finish_time)
+        if t and r.distance and r.distance > 0:
+            # 基準タイム(距離比例で推定)
+            base_time = r.distance * 0.06  # 芝良の近似基準
+            cond = (r.track_condition or "").strip()
+            cond_adj = {"良": 0, "稍重": 0.5, "重": 1.5, "不良": 2.5}.get(cond, 0)
+            adjusted_time = t - cond_adj
+            # 速いほど高い指数
+            fig = (base_time - adjusted_time) / base_time * 100 + 50
+            speed_figs.append(fig)
+
+    if speed_figs:
+        features["speed_figure_last"] = speed_figs[0]
+        top3 = sorted(speed_figs, reverse=True)[:3]
+        features["speed_figure_best3"] = top3[0]
+        features["speed_figure_avg3"] = float(np.mean(speed_figs[:3]))
+
+    # 着順安定性
+    positions = [e.finish_position for e, r in history if e.finish_position]
+    if len(positions) >= 3:
+        features["finish_std"] = float(np.std(positions))
+
+    return features
+
+
+def _calc_margin_features(session: Session, history: list[tuple[RaceEntry, Race]]) -> dict:
+    """勝ち馬とのタイム差"""
+    margins = []
+    for e, r in history[:5]:
+        my_time = _time_to_seconds(e.finish_time)
+        if not my_time:
+            continue
+        # 同レースの1着馬のタイムを取得
+        winner = (
+            session.query(RaceEntry)
+            .filter_by(race_id=r.id, finish_position=1)
+            .first()
+        )
+        if winner:
+            winner_time = _time_to_seconds(winner.finish_time)
+            if winner_time:
+                margins.append(my_time - winner_time)
+
+    return {
+        "margin_to_winner_avg": float(np.mean(margins)) if margins else 0.0,
+    }
+
+
+# =============================================================
+# 厩舎特徴量
+# =============================================================
+
+def _calc_trainer_features(horse: Horse | None, race: Race,
+                           session: Session) -> dict:
+    """厩舎成績・騎手×厩舎コンビ"""
+    features = {
+        "trainer_win_rate": 0.0,
+        "trainer_top3_rate": 0.0,
+        "jockey_trainer_combo_win": 0.0,
+    }
+
+    if not horse or not horse.trainer:
+        return features
+
+    trainer_name = horse.trainer.strip()
+    if not trainer_name:
+        return features
+
+    # 厩舎の過去成績(同厩舎の馬のエントリーを集計)
+    trainer_horses = (
+        session.query(Horse.id)
+        .filter(Horse.trainer == trainer_name)
+        .scalar_subquery()
+    )
+
+    trainer_entries = (
+        session.query(RaceEntry)
+        .join(Race, RaceEntry.race_id == Race.id)
+        .filter(
+            RaceEntry.horse_id.in_(trainer_horses),
+            RaceEntry.finish_position.isnot(None),
+            Race.race_date < race.race_date,
+        )
+        .limit(200)
+        .all()
+    )
+
+    if trainer_entries:
+        positions = [e.finish_position for e in trainer_entries if e.finish_position]
+        if positions:
+            features["trainer_win_rate"] = sum(1 for p in positions if p == 1) / len(positions)
+            features["trainer_top3_rate"] = sum(1 for p in positions if p <= 3) / len(positions)
+
+    return features
+
+
+def _calc_jockey_trainer_combo(entry: RaceEntry, horse: Horse | None,
+                                race: Race, session: Session) -> dict:
+    """騎手×厩舎コンビの勝率"""
+    if not horse or not horse.trainer or not entry.jockey_id:
+        return {"jockey_trainer_combo_win": 0.0}
+
+    trainer_name = horse.trainer.strip()
+    trainer_horses = (
+        session.query(Horse.id)
+        .filter(Horse.trainer == trainer_name)
+        .subquery()
+    )
+
+    combo_entries = (
+        session.query(RaceEntry)
+        .join(Race, RaceEntry.race_id == Race.id)
+        .filter(
+            RaceEntry.horse_id.in_(trainer_horses),
+            RaceEntry.jockey_id == entry.jockey_id,
+            RaceEntry.finish_position.isnot(None),
+            Race.race_date < race.race_date,
+        )
+        .limit(50)
+        .all()
+    )
+
+    if combo_entries:
+        positions = [e.finish_position for e in combo_entries if e.finish_position]
+        if positions:
+            return {"jockey_trainer_combo_win": sum(1 for p in positions if p == 1) / len(positions)}
+
+    return {"jockey_trainer_combo_win": 0.0}
+
+
+# =============================================================
+# 前半位置取り(Early Speed)
+# =============================================================
+
+def _calc_early_speed_features(history: list[tuple[RaceEntry, Race]]) -> dict:
+    """通過順から先行力を算出"""
+    features = {
+        "early_position_avg": 0.0,  # 前半位置取り平均
+        "late_gain_avg": 0.0,  # 後半の追い上げ幅平均
+    }
+
+    early_positions = []
+    late_gains = []
+    for e, r in history:
+        if not e.passing:
+            continue
+        parts = e.passing.replace("-", ",").split(",")
+        try:
+            nums = [int(p.strip()) for p in parts if p.strip().isdigit()]
+        except ValueError:
+            continue
+        if not nums:
+            continue
+
+        n_runners = r.n_runners or 18
+        # 正規化(1位=1.0, 最下位=0.0)
+        early_pos = nums[0] / max(1, n_runners)
+        early_positions.append(early_pos)
+
+        # 後半の追い上げ(最初の通過順 - 最後の通過順)
+        if len(nums) >= 2:
+            late_gains.append(nums[0] - nums[-1])
+
+    if early_positions:
+        features["early_position_avg"] = float(np.mean(early_positions))
+    if late_gains:
+        features["late_gain_avg"] = float(np.mean(late_gains))
+
+    return features
+
+
+# =============================================================
+# Eloレーティング
+# =============================================================
+
+# グローバルキャッシュ(セッション内で再利用)
+_elo_cache: dict[int, float] = {}
+_elo_computed = False
+
+
+def _compute_elo_ratings(session: Session, before_race: Race):
+    """全馬のEloレーティングを計算(当該レース前まで)"""
+    global _elo_cache, _elo_computed
+    if _elo_computed:
+        return
+
+    K = 16  # Elo K-factor
+    _elo_cache.clear()
+
+    # 全確定レースを日付順で取得
+    races = (
+        session.query(Race)
+        .filter(Race.status == "finished", Race.race_date < before_race.race_date)
+        .order_by(Race.race_date, Race.id)
+        .all()
+    )
+
+    for race in races:
+        entries = (
+            session.query(RaceEntry)
+            .filter(
+                RaceEntry.race_id == race.id,
+                RaceEntry.finish_position.isnot(None),
+                RaceEntry.horse_id.isnot(None),
+            )
+            .all()
+        )
+        if len(entries) < 2:
+            continue
+
+        # 各馬のElo更新
+        ratings = {e.horse_id: _elo_cache.get(e.horse_id, 1500.0) for e in entries}
+        n = len(entries)
+        new_ratings = {}
+
+        for e in entries:
+            hid = e.horse_id
+            r_self = ratings[hid]
+            delta = 0.0
+            for e2 in entries:
+                if e2.horse_id == hid:
+                    continue
+                r_opp = ratings[e2.horse_id]
+                expected = 1.0 / (1.0 + 10 ** ((r_opp - r_self) / 400))
+                actual = 1.0 if e.finish_position < e2.finish_position else (0.5 if e.finish_position == e2.finish_position else 0.0)
+                delta += K * (actual - expected) / (n - 1)
+            new_ratings[hid] = r_self + delta
+
+        _elo_cache.update(new_ratings)
+
+    _elo_computed = True
+
+
+def _get_elo_rating(horse_id: int | None) -> float:
+    if horse_id is None:
+        return 1500.0
+    return _elo_cache.get(horse_id, 1500.0)
+
+
+# =============================================================
+# クラス補正
+# =============================================================
+
+def _calc_class_adjusted_features(history: list[tuple[RaceEntry, Race]]) -> dict:
+    """レースグレードを考慮した成績補正"""
+    features = {
+        "class_adjusted_avg": 0.0,
+        "grade_change": 0.0,  # 今回と前走のクラス差
+    }
+
+    if not history:
+        return features
+
+    # グレード補正した着順(高グレードほど着順の価値が高い)
+    adjusted = []
+    for e, r in history:
+        if not e.finish_position:
+            continue
+        grade_val = _grade_to_num(r.grade)
+        # 高クラスでの好走を高評価: 補正着順 = 着順 - (グレード値 - 3) * 0.5
+        adj = e.finish_position - (grade_val - 3) * 0.5
+        adjusted.append(adj)
+
+    if adjusted:
+        features["class_adjusted_avg"] = float(np.mean(adjusted[:5]))
+
+    return features
+
+
+# =============================================================
 # 交互作用
 # =============================================================
 
@@ -579,6 +922,10 @@ def _calc_interaction_features(f: dict) -> dict:
         "pace_x_style": f.get("pace_pressure", 0.5) * (5 - f.get("running_style", 3)),
         # 天候×馬場適性(雨天時に重馬場得意馬が有利)
         "weather_x_track_pref": f.get("is_rainy", 0) * f.get("heavy_track_top3", 0),
+        # 距離変更×脚質(短縮は先行有利)
+        "dist_change_x_style": f.get("distance_change", 0) * f.get("running_style", 3),
+        # 休み明け×厩舎力
+        "fresh_x_trainer": f.get("is_fresh", 0) * f.get("trainer_win_rate", 0),
     }
 
 
@@ -588,6 +935,11 @@ def _calc_interaction_features(f: dict) -> dict:
 
 def build_features_for_race(session: Session, race: Race) -> pd.DataFrame:
     """レースの全エントリーから特徴量DataFrameを生成"""
+    # Elo計算は重いので予測時のみ(学習時はキャッシュで対応)
+    global _elo_computed
+    if not _elo_computed:
+        _compute_elo_ratings(session, race)
+
     entries = session.query(RaceEntry).filter_by(race_id=race.id).all()
     racecourse = session.query(Racecourse).filter_by(id=race.racecourse_id).first()
 
@@ -653,6 +1005,26 @@ def _build_entry_features(entry: RaceEntry, horse: Horse | None,
     # === レース情報 ===
     features.update(_calc_race_info_features(entry, race))
 
+    # === ローテーション ===
+    features.update(_calc_rotation_features(race, horse_history))
+
+    # === スピード指数 ===
+    features.update(_calc_speed_features(horse_history))
+    features.update(_calc_margin_features(session, horse_history))
+
+    # === 厩舎 ===
+    features.update(_calc_trainer_features(horse, race, session))
+    features.update(_calc_jockey_trainer_combo(entry, horse, race, session))
+
+    # === 前半位置取り ===
+    features.update(_calc_early_speed_features(horse_history))
+
+    # === Eloレーティング ===
+    features["elo_rating"] = _get_elo_rating(entry.horse_id)
+
+    # === クラス補正 ===
+    features.update(_calc_class_adjusted_features(horse_history))
+
     # === 交互作用 ===
     features.update(_calc_interaction_features(features))
 
@@ -712,6 +1084,17 @@ def _add_relative_features(df: pd.DataFrame) -> pd.DataFrame:
     if "jockey_win_rate" in df.columns:
         df["jockey_rank"] = df["jockey_win_rate"].rank(ascending=False, method="min")
 
+    # Eloレーティング rank / z-score
+    if "elo_rating" in df.columns:
+        df["elo_rank"] = df["elo_rating"].rank(ascending=False, method="min")
+        mean_e = df["elo_rating"].mean()
+        std_e = df["elo_rating"].std()
+        df["elo_z"] = (df["elo_rating"] - mean_e) / std_e if std_e > 0 else 0
+
+    # スピード指数 rank
+    if "speed_figure_avg3" in df.columns:
+        df["speed_rank"] = df["speed_figure_avg3"].rank(ascending=False, method="min")
+
     return df
 
 
@@ -745,18 +1128,31 @@ FEATURE_COLUMNS = [
     # 展開予測 (5)
     "running_style", "is_front_runner", "is_closer",
     "same_style_count", "pace_pressure",
+    # ローテーション (6)
+    "days_since_last", "rest_bucket", "is_fresh", "is_second_up",
+    "distance_change", "surface_switch",
+    # スピード指数 (5)
+    "speed_figure_last", "speed_figure_best3", "speed_figure_avg3",
+    "margin_to_winner_avg", "finish_std",
+    # 厩舎 (3)
+    "trainer_win_rate", "trainer_top3_rate", "jockey_trainer_combo_win",
+    # 前半位置取り (2)
+    "early_position_avg", "late_gain_avg",
+    # Elo・クラス (3)
+    "elo_rating", "class_adjusted_avg",
     # レース情報 (12)
     "grade_num", "n_runners", "distance", "distance_category",
     "frame_number", "horse_number", "frame_advantage",
     "track_condition_num", "is_turf", "is_dirt",
     "weather_num", "is_rainy",
-    # レース内相対 (7)
+    # レース内相対 (10)
     "last_3f_rank", "last_3f_z",
     "weight_carry_rank", "horse_weight_rank",
     "form_rank", "jockey_rank",
-    # 交互作用 (6)
+    "elo_rank", "elo_z", "speed_rank",
+    # 交互作用 (8)
     "style_x_track_cond", "bloodline_x_surface",
     "frame_x_distance", "jockey_x_horse_form", "pace_x_style",
-    "weather_x_track_pref",
+    "weather_x_track_pref", "dist_change_x_style", "fresh_x_trainer",
 ]
-# 合計: 67個
+# 合計: 86個
