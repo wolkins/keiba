@@ -62,7 +62,7 @@ def store_race_result(session: Session, race_id_str: str, data: dict) -> Race | 
             weather=race_info.get("weather", ""),
             track_condition=race_info.get("track_condition", ""),
             n_runners=len(entries_data),
-            status="finished",
+            status=data.get("status", "finished"),
         )
         session.add(race)
         session.flush()
@@ -76,7 +76,10 @@ def store_race_result(session: Session, race_id_str: str, data: dict) -> Race | 
         race.weather = race_info.get("weather") or race.weather
         race.track_condition = race_info.get("track_condition") or race.track_condition
         race.n_runners = len(entries_data) or race.n_runners
-        race.status = "finished"
+        # scheduled → finished への更新は許可、逆は不可
+        new_status = data.get("status", "finished")
+        if new_status == "finished" or race.status != "finished":
+            race.status = new_status
         if race_date:
             race.race_date = race_date
 

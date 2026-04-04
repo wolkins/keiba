@@ -9,6 +9,7 @@ from bs4 import BeautifulSoup
 from src.common.config import COURSE_CODES, REQUEST_DELAY, USER_AGENT
 
 BASE_URL = "https://db.netkeiba.com"
+RACE_URL = "https://race.netkeiba.com"
 
 
 class NetkeibaScraper:
@@ -80,7 +81,206 @@ class NetkeibaScraper:
         return races
 
     # ------------------------------------------------------------------
-    # レース結果
+    # 当日レース一覧 (race.netkeiba.com)
+    # ------------------------------------------------------------------
+    def scrape_today_race_list(self, date_str: str) -> list[dict]:
+        """当日の出走表からレースID一覧を取得 (結果未確定のレース用)
+
+        Args:
+            date_str: "YYYY-MM-DD"
+
+        Returns:
+            scrape_race_list() と同じ形式
+        """
+        ymd = date_str.replace("-", "")
+        url = f"{RACE_URL}/top/race_list_sub.html?kaisai_date={ymd}"
+        soup = self._get(url)
+
+        races = []
+        links = soup.find_all("a", href=re.compile(r"race_id=(\d{12})"))
+        seen = set()
+        for link in links:
+            m = re.search(r"race_id=(\d{12})", link.get("href", ""))
+            if not m:
+                continue
+            race_id = m.group(1)
+            if race_id in seen:
+                continue
+            seen.add(race_id)
+
+            course_code = race_id[4:6]
+            if course_code not in COURSE_CODES:
+                continue
+
+            race_number = int(race_id[10:12])
+            races.append({
+                "race_id": race_id,
+                "race_date": date_str,
+                "course_code": course_code,
+                "race_number": race_number,
+            })
+
+        return races
+
+    # ------------------------------------------------------------------
+    # 当日出走表 (race.netkeiba.com)
+    # ------------------------------------------------------------------
+    def scrape_shutuba(self, race_id: str) -> dict:
+        """出走表ページから出馬情報を取得 (結果未確定のレース用)
+
+        Args:
+            race_id: 12桁レースID
+
+        Returns:
+            scrape_race_result() と同じ形式 (finish_position は None)
+        """
+        url = f"{RACE_URL}/race/shutuba.html?race_id={race_id}"
+        soup = self._get(url)
+
+        race_info = self._parse_shutuba_race_info(soup)
+        entries = self._parse_shutuba_entries(soup)
+
+        return {"race": race_info, "entries": entries}
+
+    def _parse_shutuba_race_info(self, soup: BeautifulSoup) -> dict:
+        """出走表ページからレース情報をパース"""
+        info = {
+            "race_name": "",
+            "grade": "",
+            "surface": "",
+            "distance": 0,
+            "course_type": "",
+            "weather": "",
+            "track_condition": "",
+        }
+
+        # レース名
+        name_tag = soup.select_one(".RaceName")
+        if name_tag:
+            info["race_name"] = name_tag.get_text(strip=True)
+
+        # グレード
+        info["grade"] = self._detect_grade(soup, info["race_name"])
+
+        # レース条件: "芝1600m" 等
+        data_tag = soup.select_one(".RaceData01") or soup.select_one(".RaceData")
+        if data_tag:
+            text = data_tag.get_text(" ", strip=True)
+            self._parse_condition_text(text, info)
+
+        return info
+
+    def _parse_shutuba_entries(self, soup: BeautifulSoup) -> list[dict]:
+        """出走表テーブルをパース"""
+        entries = []
+        table = soup.find("table", class_=re.compile(r"Shutuba_Table|shutuba"))
+        if not table:
+            table = soup.find("table", class_=re.compile(r"race_table"))
+        if not table:
+            return entries
+
+        rows = table.find_all("tr")
+        for row in rows:
+            cells = row.find_all("td")
+            if len(cells) < 5:
+                continue
+
+            entry = self._parse_shutuba_row(cells)
+            if entry:
+                entries.append(entry)
+
+        return entries
+
+    def _parse_shutuba_row(self, cells: list) -> dict | None:
+        """出走表の1行をパース"""
+        texts = [c.get_text(strip=True) for c in cells]
+
+        # 枠番・馬番を探す
+        frame_number = None
+        horse_number = None
+        for i, t in enumerate(texts[:4]):
+            if t.isdigit():
+                if frame_number is None:
+                    frame_number = int(t)
+                elif horse_number is None:
+                    horse_number = int(t)
+                    break
+
+        if horse_number is None:
+            return None
+
+        entry = {
+            "finish_position": None,  # 未確定
+            "frame_number": frame_number,
+            "horse_number": horse_number,
+        }
+
+        # 馬名・馬ID
+        for cell in cells:
+            horse_link = cell.find("a", href=re.compile(r"/horse/"))
+            if horse_link:
+                entry["horse_name"] = horse_link.get_text(strip=True)
+                hid_m = re.search(r"/horse/(\w+)", horse_link.get("href", ""))
+                if hid_m:
+                    entry["horse_id"] = hid_m.group(1)
+                break
+        else:
+            entry["horse_name"] = ""
+            entry["horse_id"] = ""
+
+        # 騎手名・騎手ID
+        for cell in cells:
+            jockey_link = cell.find("a", href=re.compile(r"/jockey/"))
+            if jockey_link:
+                entry["jockey_name"] = jockey_link.get_text(strip=True)
+                jid_m = re.search(r"/jockey/(?:result/recent/)?(\d+)", jockey_link.get("href", ""))
+                entry["jockey_id"] = jid_m.group(1) if jid_m else ""
+                break
+        else:
+            entry["jockey_name"] = ""
+            entry["jockey_id"] = ""
+
+        # 調教師
+        entry["trainer"] = ""
+        for cell in cells:
+            trainer_link = cell.find("a", href=re.compile(r"/trainer/"))
+            if trainer_link:
+                entry["trainer"] = trainer_link.get_text(strip=True)
+                break
+
+        # 性齢・斤量: 数字以外のテキストから探す
+        entry["sex_age"] = ""
+        entry["weight_carry"] = None
+        for t in texts:
+            if re.match(r"^[牡牝セ]\d+$", t):
+                entry["sex_age"] = t
+            try:
+                v = float(t)
+                if 40 < v < 70:  # 斤量の範囲
+                    entry["weight_carry"] = v
+            except ValueError:
+                pass
+
+        # 馬体重
+        entry["horse_weight"] = None
+        entry["weight_diff"] = None
+        for t in texts:
+            self._parse_horse_weight(t, entry)
+            if entry["horse_weight"]:
+                break
+
+        # 出走表には結果系データなし
+        entry["finish_time"] = ""
+        entry["margin"] = ""
+        entry["last_3f"] = None
+        entry["odds_win"] = None
+        entry["popularity"] = None
+        entry["passing"] = ""
+
+        return entry
+
+    # ------------------------------------------------------------------
+    # レース結果 (db.netkeiba.com)
     # ------------------------------------------------------------------
     def scrape_race_result(self, race_id: str) -> dict:
         """レース結果を取得

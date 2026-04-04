@@ -45,8 +45,18 @@ def scrape(target_date: str | None, with_odds: bool):
     session = get_session()
 
     try:
+        # まず過去結果DB(db.netkeiba.com)から取得を試みる
         with console.status("レース一覧を取得中..."):
             race_list = scraper.scrape_race_list(target_date)
+
+        # 見つからなければ当日出走表(race.netkeiba.com)から取得
+        use_shutuba = False
+        if not race_list:
+            with console.status("当日出走表を取得中..."):
+                race_list = scraper.scrape_today_race_list(target_date)
+            if race_list:
+                use_shutuba = True
+                console.print(f"[cyan]出走表モードで取得します (結果未確定)[/cyan]")
 
         if not race_list:
             console.print("[yellow]この日のレースが見つかりませんでした。[/yellow]")
@@ -59,12 +69,19 @@ def scrape(target_date: str | None, with_odds: bool):
             console.print(f"  [{i+1}/{len(race_list)}] {race_id} ...")
 
             try:
-                result = scraper.scrape_race_result(race_id)
+                if use_shutuba:
+                    result = scraper.scrape_shutuba(race_id)
+                else:
+                    result = scraper.scrape_race_result(race_id)
+
                 if result:
                     result["race_date"] = target_date
+                    if use_shutuba:
+                        result["status"] = "scheduled"
                     race = store_race_result(session, race_id, result)
                     n_entries = len(result.get("entries", []))
-                    console.print(f"    → [green]出走表: {n_entries}頭[/green]")
+                    label = "出走表" if use_shutuba else "結果"
+                    console.print(f"    → [green]{label}: {n_entries}頭[/green]")
                 else:
                     console.print(f"    → [yellow]データなし[/yellow]")
 
