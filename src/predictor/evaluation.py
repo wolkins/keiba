@@ -35,6 +35,11 @@ def evaluate_predictions(valid_df: pd.DataFrame, session: Session = None) -> dic
             continue
         n_races += 1
 
+        # finish_positionがNaNの行を除外（出走取消等）
+        race_data = race_data.dropna(subset=["finish_position"])
+        if race_data.empty:
+            continue
+
         # 予測スコア降順でソート
         race_data = race_data.sort_values("pred_score", ascending=False).reset_index(drop=True)
         positions = race_data["finish_position"].values
