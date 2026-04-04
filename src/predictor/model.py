@@ -392,25 +392,41 @@ class KeibaPredictor:
         bets = []
 
         if self.mode == "accuracy":
-            # 的中率重視: 単勝・馬連・ワイド
+            # 的中率重視: 単勝・馬連・三連単・ワイド
             bets.append({
                 "bet_type": "単勝",
                 "combination": str(top3[0]["horse_number"]),
-                "amount": budget // 3,
+                "amount": budget // 4,
                 "reason": f"◎ {top3[0]['horse_name']} (win={top3[0].get('calibrated_win_prob', 0):.1%})",
             })
             if len(top3) >= 2:
                 bets.append({
                     "bet_type": "馬連",
                     "combination": f"{top3[0]['horse_number']}-{top3[1]['horse_number']}",
-                    "amount": budget // 3,
+                    "amount": budget // 4,
                     "reason": f"◎ {top3[0]['horse_name']} - ○ {top3[1]['horse_name']}",
                 })
             if len(top3) >= 3:
+                # 三連単: 1着固定で2-3着の組み合わせ
+                n1 = top3[0]["horse_number"]
+                n2 = top3[1]["horse_number"]
+                n3 = top3[2]["horse_number"]
+                bets.append({
+                    "bet_type": "三連単",
+                    "combination": f"{n1}→{n2}→{n3}",
+                    "amount": budget // 6,
+                    "reason": f"本線 ◎→○→▲",
+                })
+                bets.append({
+                    "bet_type": "三連単",
+                    "combination": f"{n1}→{n3}→{n2}",
+                    "amount": budget // 6,
+                    "reason": f"裏目 ◎→▲→○",
+                })
                 bets.append({
                     "bet_type": "ワイド",
                     "combination": f"{top3[0]['horse_number']}-{top3[2]['horse_number']}",
-                    "amount": budget // 4,
+                    "amount": budget // 6,
                     "reason": f"◎ {top3[0]['horse_name']} - ▲ {top3[2]['horse_name']}",
                 })
         else:

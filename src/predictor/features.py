@@ -526,6 +526,11 @@ def _calc_race_info_features(entry: RaceEntry, race: Race) -> dict:
     is_turf = 1 if "芝" in surface else 0
     is_dirt = 1 if "ダ" in surface else 0
 
+    # 天候
+    weather = (race.weather or "").strip()
+    weather_num = {"晴": 0, "曇": 1, "小雨": 2, "雨": 3, "雪": 4}.get(weather, 0)
+    is_rainy = 1 if weather in ("小雨", "雨", "雪") else 0
+
     return {
         "grade_num": _grade_to_num(race.grade),
         "n_runners": n_runners,
@@ -537,6 +542,8 @@ def _calc_race_info_features(entry: RaceEntry, race: Race) -> dict:
         "track_condition_num": track_cond_num,
         "is_turf": is_turf,
         "is_dirt": is_dirt,
+        "weather_num": weather_num,
+        "is_rainy": is_rainy,
     }
 
 
@@ -570,6 +577,8 @@ def _calc_interaction_features(f: dict) -> dict:
         "jockey_x_horse_form": f.get("jockey_win_rate", 0) * (10 - min(10, f.get("recent_avg_finish", 5))),
         # ペース圧×脚質
         "pace_x_style": f.get("pace_pressure", 0.5) * (5 - f.get("running_style", 3)),
+        # 天候×馬場適性(雨天時に重馬場得意馬が有利)
+        "weather_x_track_pref": f.get("is_rainy", 0) * f.get("heavy_track_top3", 0),
     }
 
 
@@ -736,16 +745,18 @@ FEATURE_COLUMNS = [
     # 展開予測 (5)
     "running_style", "is_front_runner", "is_closer",
     "same_style_count", "pace_pressure",
-    # レース情報 (10)
+    # レース情報 (12)
     "grade_num", "n_runners", "distance", "distance_category",
     "frame_number", "horse_number", "frame_advantage",
     "track_condition_num", "is_turf", "is_dirt",
+    "weather_num", "is_rainy",
     # レース内相対 (7)
     "last_3f_rank", "last_3f_z",
     "weight_carry_rank", "horse_weight_rank",
     "form_rank", "jockey_rank",
-    # 交互作用 (5)
+    # 交互作用 (6)
     "style_x_track_cond", "bloodline_x_surface",
     "frame_x_distance", "jockey_x_horse_form", "pace_x_style",
+    "weather_x_track_pref",
 ]
-# 合計: 64個
+# 合計: 67個
