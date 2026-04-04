@@ -187,8 +187,10 @@ def scrape_range(date_from: str, date_to: str | None):
 @click.option("--race", "race_number", default=None, type=int, help="レース番号")
 @click.option("--mode", type=click.Choice(["accuracy", "roi"]), default="accuracy")
 @click.option("--budget", default=1000, type=int, help="予算(円)")
+@click.option("--weather", default=None, help="天候 (晴/曇/小雨/雨/雪)")
+@click.option("--track", default=None, help="馬場状態 (良/稍重/重/不良)")
 def predict(target_date: str | None, venue: str | None, race_number: int | None,
-            mode: str, budget: int):
+            mode: str, budget: int, weather: str | None, track: str | None):
     """レースの予想を表示"""
     if target_date is None:
         target_date = date.today().isoformat()
@@ -216,6 +218,20 @@ def predict(target_date: str | None, venue: str | None, race_number: int | None,
         if not races:
             console.print(f"[yellow]{target_date} のレースデータがありません[/yellow]")
             return
+
+        # 天候・馬場状態の上書き
+        if weather or track:
+            for race in races:
+                if weather:
+                    race.weather = weather
+                if track:
+                    race.track_condition = track
+            condition_info = []
+            if weather:
+                condition_info.append(f"天候: {weather}")
+            if track:
+                condition_info.append(f"馬場: {track}")
+            console.print(f"[cyan]条件指定: {' / '.join(condition_info)}[/cyan]")
 
         mode_label = "的中率重視" if mode == "accuracy" else "回収率重視"
         console.print(f"\n[bold blue]予想モード: {mode_label}[/bold blue]\n")
