@@ -97,7 +97,8 @@ def scrape(target_date: str | None, with_odds: bool):
 @cli.command("scrape-range")
 @click.option("--from", "date_from", required=True, help="開始日 (YYYY-MM-DD)")
 @click.option("--to", "date_to", default=None, help="終了日 (YYYY-MM-DD)")
-def scrape_range(date_from: str, date_to: str | None):
+@click.option("--force", is_flag=True, default=False, help="既存データがあっても再取得する")
+def scrape_range(date_from: str, date_to: str | None, force: bool):
     """期間指定で一括データ取得"""
     import time as time_mod
 
@@ -110,7 +111,7 @@ def scrape_range(date_from: str, date_to: str | None):
 
     total_days = (end - start).days + 1
     from src.common.config import DAY_PAUSE
-    console.print(f"\n[bold blue]一括取得: {date_from} → {end.isoformat()} ({total_days}日間)[/bold blue]\n")
+    console.print(f"\n[bold blue]一括取得: {date_from} → {end.isoformat()} ({total_days}日間){' [強制再取得]' if force else ''}[/bold blue]\n")
 
     scraper = NetkeibaScraper()
     session = get_session()
@@ -132,7 +133,7 @@ def scrape_range(date_from: str, date_to: str | None):
             # スキップ判定
             dt = datetime.strptime(current_str, "%Y-%m-%d").date()
             existing_count = session.query(Race).filter(Race.race_date == dt).count()
-            if existing_count > 0:
+            if existing_count > 0 and not force:
                 console.print(f"[dim][{now}] [{day_num}/{total_days}] {current_str} → {existing_count}レース取得済み, スキップ[/dim]")
                 current += timedelta(days=1)
                 continue
