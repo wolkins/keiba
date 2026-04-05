@@ -103,34 +103,62 @@ class KeibaPredictor:
         y_valid = valid_df["label"]
         group_valid = valid_df.groupby("race_id").size().tolist()
 
-        # === LambdaRank学習 ===
+        # === LambdaRank学習 (seedアンサンブル) ===
         if HAS_LIGHTGBM:
-            ranker = lgb.LGBMRanker(
-                objective="lambdarank",
-                metric="ndcg",
-                ndcg_eval_at=[1, 3],
-                learning_rate=0.03,
-                num_leaves=31,
-                min_data_in_leaf=max(30, len(train_df) // 80),
-                feature_fraction=0.7,
-                bagging_fraction=0.8,
-                bagging_freq=5,
-                lambda_l1=0.1,
-                lambda_l2=1.0,
-                n_estimators=1500,
-                verbose=-1,
-            )
-            callbacks = [lgb.early_stopping(50, verbose=False)]
-            if len(valid_df) > 0 and group_valid:
-                ranker.fit(
-                    X_train, y_train, group=group_train,
-                    sample_weight=w_train,
-                    eval_set=[(X_valid, y_valid)],
-                    eval_group=[group_valid],
-                    callbacks=callbacks,
-                )
-            else:
-                ranker.fit(X_train, y_train, group=group_train, sample_weight=w_train)
+            # label_gain: 1着に重みを集中
+            n_labels = int(max_pos) + 1
+            label_gain = [0.0] * n_labels
+            for i in range(n_labels):
+                # 1着(label=max_pos)=100, 2着=10, 3着=5, 4着以下=着順に応じて漸減
+                pos = max_pos - i  # 実際の着順
+                if pos <= 0:
+                    label_gain[i] = 100.0
+                elif pos == 1:
+                    label_gain[i] = 10.0
+                elif pos == 2:
+                    label_gain[i] = 5.0
+                else:
+                    label_gain[i] = max(0.0, 3.0 - pos * 0.1)
+
+            base_params = {
+                "objective": "lambdarank",
+                "metric": "ndcg",
+                "ndcg_eval_at": [1, 3],
+                "label_gain": label_gain,
+                "lambdarank_truncation_level": 5,
+                "learning_rate": 0.02,
+                "num_leaves": 63,
+                "min_data_in_leaf": max(50, len(train_df) // 60),
+                "feature_fraction": 0.75,
+                "bagging_fraction": 0.8,
+                "bagging_freq": 3,
+                "lambda_l1": 0.5,
+                "lambda_l2": 5.0,
+                "min_gain_to_split": 0.05,
+                "n_estimators": 2000,
+                "verbose": -1,
+            }
+
+            # seedアンサンブル: 5モデルの平均
+            n_seeds = 5
+            models = []
+            for seed in range(n_seeds):
+                params = {**base_params, "random_state": seed * 42 + 7}
+                r = lgb.LGBMRanker(**params)
+                callbacks = [lgb.early_stopping(100, verbose=False)]
+                if len(valid_df) > 0 and group_valid:
+                    r.fit(
+                        X_train, y_train, group=group_train,
+                        sample_weight=w_train,
+                        eval_set=[(X_valid, y_valid)],
+                        eval_group=[group_valid],
+                        callbacks=callbacks,
+                    )
+                else:
+                    r.fit(X_train, y_train, group=group_train, sample_weight=w_train)
+                models.append(r)
+
+            ranker = models[0]  # メインモデル(保存用)
         else:
             ranker = GradientBoostingRegressor(
                 n_estimators=200, max_depth=5, learning_rate=0.1, random_state=42,
@@ -138,11 +166,13 @@ class KeibaPredictor:
             ranker.fit(X_train, y_train, sample_weight=w_train)
 
         self.model = ranker
+        self._seed_models = models if HAS_LIGHTGBM else []
         self._feature_cols = available_cols
 
         MODEL_DIR.mkdir(parents=True, exist_ok=True)
         with open(self._model_path, "wb") as f:
-            pickle.dump({"model": ranker, "features": available_cols}, f)
+            pickle.dump({"model": ranker, "features": available_cols,
+                         "seed_models": models if HAS_LIGHTGBM else []}, f)
 
         # === キャリブレータfit + 評価 ===
         eval_results = {}
@@ -209,9 +239,11 @@ class KeibaPredictor:
             if isinstance(data, dict):
                 self.model = data["model"]
                 self._feature_cols = data.get("features", FEATURE_COLUMNS)
+                self._seed_models = data.get("seed_models", [])
             else:
                 self.model = data
                 self._feature_cols = FEATURE_COLUMNS
+                self._seed_models = []
             # キャリブレータも読み込み (なくても動作する)
             self._calibrator_win.load()
             self._calibrator_top3.load()
@@ -234,22 +266,27 @@ class KeibaPredictor:
         available_cols = [c for c in self._feature_cols if c in df.columns]
         X = df[available_cols].fillna(0)
 
-        # アンサンブル予測を試行、なければLambdaRank単体
-        ensemble = self._ensemble
-        if ensemble is None:
-            ensemble = EnsemblePredictor()
-            if ensemble.load():
-                self._ensemble = ensemble
-            else:
-                ensemble = None
-
-        if ensemble is not None:
-            try:
-                scores = ensemble.predict(X)
-            except Exception:
-                scores = self.model.predict(X)
+        # seedアンサンブル予測（複数モデルの平均）
+        if hasattr(self, '_seed_models') and len(self._seed_models) > 1:
+            all_scores = np.array([m.predict(X) for m in self._seed_models])
+            scores = all_scores.mean(axis=0)
         else:
-            scores = self.model.predict(X)
+            # フォールバック: 単体モデル
+            ensemble = self._ensemble
+            if ensemble is None:
+                ensemble = EnsemblePredictor()
+                if ensemble.load():
+                    self._ensemble = ensemble
+                else:
+                    ensemble = None
+
+            if ensemble is not None:
+                try:
+                    scores = ensemble.predict(X)
+                except Exception:
+                    scores = self.model.predict(X)
+            else:
+                scores = self.model.predict(X)
 
         s_min, s_max = scores.min(), scores.max()
         if s_max > s_min:

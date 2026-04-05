@@ -240,33 +240,57 @@ def walk_forward_cv(session: Session, n_splits: int = 4, gap_days: int = 7) -> d
         y_valid = valid_df["label"]
         group_valid = valid_df.groupby("race_id").size().tolist()
 
-        # LightGBM LambdaRank
-        ranker = lgb.LGBMRanker(
-            objective="lambdarank",
-            metric="ndcg",
-            ndcg_eval_at=[1, 3],
-            learning_rate=0.03,
-            num_leaves=31,
-            min_data_in_leaf=max(30, len(train_df) // 80),
-            feature_fraction=0.7,
-            bagging_fraction=0.8,
-            bagging_freq=5,
-            lambda_l1=0.1,
-            lambda_l2=1.0,
-            n_estimators=1500,
-            verbose=-1,
-        )
-        callbacks = [lgb.early_stopping(50, verbose=False)]
-        ranker.fit(
-            X_train, y_train, group=group_train,
-            sample_weight=w_train,
-            eval_set=[(X_valid, y_valid)],
-            eval_group=[group_valid],
-            callbacks=callbacks,
-        )
+        # LightGBM LambdaRank (label_gain + seedアンサンブル)
+        max_pos = int(train_df["finish_position"].max())
+        n_labels = max_pos + 1
+        label_gain = [0.0] * n_labels
+        for i in range(n_labels):
+            pos = max_pos - i
+            if pos <= 0:
+                label_gain[i] = 100.0
+            elif pos == 1:
+                label_gain[i] = 10.0
+            elif pos == 2:
+                label_gain[i] = 5.0
+            else:
+                label_gain[i] = max(0.0, 3.0 - pos * 0.1)
 
-        # 予測
-        valid_df["pred_score"] = ranker.predict(X_valid)
+        base_params = {
+            "objective": "lambdarank",
+            "metric": "ndcg",
+            "ndcg_eval_at": [1, 3],
+            "label_gain": label_gain,
+            "lambdarank_truncation_level": 5,
+            "learning_rate": 0.02,
+            "num_leaves": 63,
+            "min_data_in_leaf": max(50, len(train_df) // 60),
+            "feature_fraction": 0.75,
+            "bagging_fraction": 0.8,
+            "bagging_freq": 3,
+            "lambda_l1": 0.5,
+            "lambda_l2": 5.0,
+            "min_gain_to_split": 0.05,
+            "n_estimators": 2000,
+            "verbose": -1,
+        }
+
+        # seedアンサンブル: 3モデル(evaluateは速度重視で少なめ)
+        seed_scores = []
+        for seed in range(3):
+            params = {**base_params, "random_state": seed * 42 + 7}
+            ranker = lgb.LGBMRanker(**params)
+            callbacks = [lgb.early_stopping(100, verbose=False)]
+            ranker.fit(
+                X_train, y_train, group=group_train,
+                sample_weight=w_train,
+                eval_set=[(X_valid, y_valid)],
+                eval_group=[group_valid],
+                callbacks=callbacks,
+            )
+            seed_scores.append(ranker.predict(X_valid))
+
+        # 予測（seedアンサンブルの平均）
+        valid_df["pred_score"] = np.mean(seed_scores, axis=0)
 
         # オッズ情報を付加
         odds_map = {}
