@@ -969,10 +969,39 @@ def _calc_interaction_features(f: dict) -> dict:
 # メイン特徴量構築
 # =============================================================
 
+# Racecourseキャッシュ
+_racecourse_cache: dict[int, Racecourse] = {}
+
+
+def _ensure_racecourse_cache(session: Session):
+    global _racecourse_cache
+    if _racecourse_cache:
+        return
+    for rc in session.query(Racecourse).all():
+        _racecourse_cache[rc.id] = rc
+
+
+# Horse/Jockeyキャッシュ
+_horse_cache: dict[int, Horse] = {}
+_jockey_cache: dict[int, Jockey] = {}
+
+
+def _ensure_horse_jockey_cache(session: Session):
+    global _horse_cache, _jockey_cache
+    if not _horse_cache:
+        for h in session.query(Horse).all():
+            _horse_cache[h.id] = h
+    if not _jockey_cache:
+        for j in session.query(Jockey).all():
+            _jockey_cache[j.id] = j
+
+
 def build_features_for_race(session: Session, race: Race) -> pd.DataFrame:
     """レースの全エントリーから特徴量DataFrameを生成"""
     # 事前キャッシュ計算(初回のみ)
     global _elo_computed, _trainer_cache_computed, _winner_cache_computed
+    _ensure_racecourse_cache(session)
+    _ensure_horse_jockey_cache(session)
     if not _elo_computed:
         _compute_elo_ratings(session, race)
     if not _trainer_cache_computed:
@@ -981,18 +1010,25 @@ def build_features_for_race(session: Session, race: Race) -> pd.DataFrame:
         _precompute_winner_times(session, race.race_date)
 
     entries = session.query(RaceEntry).filter_by(race_id=race.id).all()
-    racecourse = session.query(Racecourse).filter_by(id=race.racecourse_id).first()
+    racecourse = _racecourse_cache.get(race.racecourse_id)
 
     if not entries:
         return pd.DataFrame()
 
+    # horse_history/jockey_historyを一括プリロード
+    horse_ids = {e.horse_id for e in entries if e.horse_id}
+    jockey_ids = {e.jockey_id for e in entries if e.jockey_id}
+
+    horse_histories = _batch_get_horse_histories(session, horse_ids, race)
+    jockey_histories = _batch_get_jockey_histories(session, jockey_ids, race)
+
     rows = []
     for entry in entries:
-        horse = session.query(Horse).filter_by(id=entry.horse_id).first() if entry.horse_id else None
-        jockey = session.query(Jockey).filter_by(id=entry.jockey_id).first() if entry.jockey_id else None
+        horse = _horse_cache.get(entry.horse_id) if entry.horse_id else None
+        jockey = _jockey_cache.get(entry.jockey_id) if entry.jockey_id else None
 
-        horse_history = _get_horse_history(session, entry.horse_id, race.id, limit=10) if entry.horse_id else []
-        jockey_history = _get_jockey_history(session, entry.jockey_id, race.id, limit=50) if entry.jockey_id else []
+        horse_history = horse_histories.get(entry.horse_id, []) if entry.horse_id else []
+        jockey_history = jockey_histories.get(entry.jockey_id, []) if entry.jockey_id else []
 
         row = _build_entry_features(entry, horse, jockey, race, racecourse,
                                     entries, horse_history, jockey_history, session)
@@ -1001,6 +1037,72 @@ def build_features_for_race(session: Session, race: Race) -> pd.DataFrame:
     df = pd.DataFrame(rows)
     df = _add_relative_features(df)
     return df
+
+
+def _batch_get_horse_histories(session: Session, horse_ids: set[int],
+                                current_race: Race) -> dict[int, list[tuple[RaceEntry, Race]]]:
+    """複数馬の履歴を一括取得"""
+    if not horse_ids:
+        return {}
+
+    all_entries = (
+        session.query(RaceEntry, Race)
+        .join(Race, RaceEntry.race_id == Race.id)
+        .filter(
+            RaceEntry.horse_id.in_(horse_ids),
+            RaceEntry.finish_position.isnot(None),
+            or_(
+                Race.race_date < current_race.race_date,
+                and_(
+                    Race.race_date == current_race.race_date,
+                    Race.id < current_race.id,
+                ),
+            ),
+        )
+        .order_by(RaceEntry.horse_id, Race.race_date.desc(), Race.id.desc())
+        .all()
+    )
+
+    from collections import defaultdict
+    result = defaultdict(list)
+    for entry, race in all_entries:
+        if len(result[entry.horse_id]) < 10:
+            result[entry.horse_id].append((entry, race))
+
+    return dict(result)
+
+
+def _batch_get_jockey_histories(session: Session, jockey_ids: set[int],
+                                 current_race: Race) -> dict[int, list[tuple[RaceEntry, Race]]]:
+    """複数騎手の履歴を一括取得"""
+    if not jockey_ids:
+        return {}
+
+    all_entries = (
+        session.query(RaceEntry, Race)
+        .join(Race, RaceEntry.race_id == Race.id)
+        .filter(
+            RaceEntry.jockey_id.in_(jockey_ids),
+            RaceEntry.finish_position.isnot(None),
+            or_(
+                Race.race_date < current_race.race_date,
+                and_(
+                    Race.race_date == current_race.race_date,
+                    Race.id < current_race.id,
+                ),
+            ),
+        )
+        .order_by(RaceEntry.jockey_id, Race.race_date.desc(), Race.id.desc())
+        .all()
+    )
+
+    from collections import defaultdict
+    result = defaultdict(list)
+    for entry, race in all_entries:
+        if len(result[entry.jockey_id]) < 50:
+            result[entry.jockey_id].append((entry, race))
+
+    return dict(result)
 
 
 def _build_entry_features(entry: RaceEntry, horse: Horse | None,
