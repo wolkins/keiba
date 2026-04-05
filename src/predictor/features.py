@@ -939,6 +939,38 @@ def _calc_class_adjusted_features(history: list[tuple[RaceEntry, Race]]) -> dict
 
 
 # =============================================================
+# オッズ・市場情報
+# =============================================================
+
+def _calc_odds_features(entry: RaceEntry, all_entries: list[RaceEntry]) -> dict:
+    """オッズ・人気から市場情報特徴量を算出"""
+    features = {
+        "odds_win_log": 0.0,
+        "popularity": 0,
+        "market_implied_prob": 0.0,
+        "odds_gap_to_fav": 0.0,
+    }
+
+    odds = entry.odds_win
+    if not odds or odds <= 0:
+        return features
+
+    features["odds_win_log"] = float(np.log(odds))
+    features["popularity"] = entry.popularity or 0
+    features["market_implied_prob"] = 1.0 / odds
+
+    # 1番人気との差
+    fav_odds = min(
+        (e.odds_win for e in all_entries if e.odds_win and e.odds_win > 0),
+        default=odds,
+    )
+    if fav_odds > 0:
+        features["odds_gap_to_fav"] = float(np.log(odds) - np.log(fav_odds))
+
+    return features
+
+
+# =============================================================
 # 交互作用
 # =============================================================
 
@@ -1167,6 +1199,9 @@ def _build_entry_features(entry: RaceEntry, horse: Horse | None,
     # === クラス補正 ===
     features.update(_calc_class_adjusted_features(horse_history))
 
+    # === オッズ・市場情報 ===
+    features.update(_calc_odds_features(entry, all_entries))
+
     # === 交互作用 ===
     features.update(_calc_interaction_features(features))
 
@@ -1237,6 +1272,20 @@ def _add_relative_features(df: pd.DataFrame) -> pd.DataFrame:
     if "speed_figure_avg3" in df.columns:
         df["speed_rank"] = df["speed_figure_avg3"].rank(ascending=False, method="min")
 
+    # オッズ rank / z-score
+    if "odds_win_log" in df.columns:
+        valid = df["odds_win_log"] > 0
+        if valid.any():
+            df["odds_rank"] = df.loc[valid, "odds_win_log"].rank(method="min")  # 低オッズ=人気=低ランク
+            mean_o = df.loc[valid, "odds_win_log"].mean()
+            std_o = df.loc[valid, "odds_win_log"].std()
+            df["odds_z"] = (df["odds_win_log"] - mean_o) / std_o if std_o > 0 else 0
+        else:
+            df["odds_rank"] = 8.0
+            df["odds_z"] = 0.0
+        df["odds_rank"] = df["odds_rank"].fillna(8.0)
+        df["odds_z"] = df["odds_z"].fillna(0.0)
+
     return df
 
 
@@ -1280,21 +1329,24 @@ FEATURE_COLUMNS = [
     "trainer_win_rate", "trainer_top3_rate", "jockey_trainer_combo_win",
     # 前半位置取り (2)
     "early_position_avg", "late_gain_avg",
-    # Elo・クラス (3)
+    # Elo・クラス (2)
     "elo_rating", "class_adjusted_avg",
+    # オッズ・市場情報 (4)
+    "odds_win_log", "popularity", "market_implied_prob", "odds_gap_to_fav",
     # レース情報 (12)
     "grade_num", "n_runners", "distance", "distance_category",
     "frame_number", "horse_number", "frame_advantage",
     "track_condition_num", "is_turf", "is_dirt",
     "weather_num", "is_rainy",
-    # レース内相対 (10)
+    # レース内相対 (12)
     "last_3f_rank", "last_3f_z",
     "weight_carry_rank", "horse_weight_rank",
     "form_rank", "jockey_rank",
     "elo_rank", "elo_z", "speed_rank",
+    "odds_rank", "odds_z",
     # 交互作用 (8)
     "style_x_track_cond", "bloodline_x_surface",
     "frame_x_distance", "jockey_x_horse_form", "pace_x_style",
     "weather_x_track_pref", "dist_change_x_style", "fresh_x_trainer",
 ]
-# 合計: 86個
+# 合計: 95個

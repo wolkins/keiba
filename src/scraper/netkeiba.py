@@ -523,43 +523,54 @@ class NetkeibaScraper:
         # 着差
         entry["margin"] = texts[8] if len(texts) > 8 else ""
 
-        # 通過順
+        # 後半カラムは列数がサイトによって異なるため、内容ベースで検出
         entry["passing"] = ""
-        # 上がり3F
         entry["last_3f"] = None
-        # 単勝オッズ
         entry["odds_win"] = None
-        # 人気
         entry["popularity"] = None
-
-        # 後半のカラムはサイトのバリエーションがあるため
-        # インデックスで取得しつつフォールバック
-        if len(texts) > 9:
-            entry["passing"] = texts[9]
-
-        if len(texts) > 10:
-            try:
-                entry["last_3f"] = float(texts[10])
-            except ValueError:
-                pass
-
-        if len(texts) > 11:
-            try:
-                entry["odds_win"] = float(texts[11])
-            except ValueError:
-                pass
-
-        if len(texts) > 12:
-            try:
-                entry["popularity"] = int(texts[12])
-            except ValueError:
-                pass
-
-        # 馬体重 "480(+2)" or "480(-4)" or "計不"
         entry["horse_weight"] = None
         entry["weight_diff"] = None
-        if len(texts) > 13:
-            self._parse_horse_weight(texts[13], entry)
+
+        for i in range(8, len(texts)):
+            t = texts[i].strip()
+            if not t or t == "**":
+                continue
+
+            # 通過順: "3-3-2-1" パターン
+            if re.match(r"^\d+-\d+", t) and not entry["passing"]:
+                entry["passing"] = t
+                continue
+
+            # 上がり3F: 30-40秒台の小数
+            if entry["last_3f"] is None:
+                try:
+                    v = float(t)
+                    if 30.0 <= v <= 45.0:
+                        entry["last_3f"] = v
+                        continue
+                except ValueError:
+                    pass
+
+            # 単勝オッズ: 1.0-999.9の小数
+            if entry["odds_win"] is None:
+                try:
+                    v = float(t)
+                    if 1.0 <= v <= 9999.9 and "." in t:
+                        entry["odds_win"] = v
+                        continue
+                except ValueError:
+                    pass
+
+            # 人気: 1-18の整数
+            if entry["popularity"] is None and t.isdigit():
+                v = int(t)
+                if 1 <= v <= 30:
+                    entry["popularity"] = v
+                    continue
+
+            # 馬体重: "480(+2)" パターン
+            if entry["horse_weight"] is None:
+                self._parse_horse_weight(t, entry)
 
         # 調教師 (馬体重の次のカラム、あるいはリンクから)
         entry["trainer"] = ""
