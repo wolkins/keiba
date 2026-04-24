@@ -529,6 +529,84 @@ def status():
     session.close()
 
 
+@cli.command("evaluate-win5")
+@click.option("--folds", default=4, type=int, help="CV fold数")
+@click.option("--gap-days", default=7, type=int, help="学習/検証間ギャップ日数")
+@click.option("--show-days", default=10, type=int, help="表示する日次結果の件数 (hit優先)")
+def evaluate_win5(folds: int, gap_days: int, show_days: int):
+    """WIN5 日次バックテスト (hit-only モード)
+
+    walk_forward_cv と同じ OOF 予測を使い、Win5TargetRace の 5R 組合せ単位で
+    「各レース top-1 を1点ずつ買う」戦略の hit rate を算出する。
+    EV モード・配当モデルは未実装 (制度変更 2026-04-25 以降のデータ蓄積待ち)。
+    """
+    from src.predictor.win5_evaluation import Win5Evaluator
+
+    session = get_session()
+    console.print(f"\n[bold blue]WIN5 バックテスト (hit-only / {folds} fold, gap={gap_days}日)[/bold blue]\n")
+
+    try:
+        with console.status("OOF生成 → WIN5評価中..."):
+            evaluator = Win5Evaluator()
+            result = evaluator.evaluate(session, n_splits=folds, gap_days=gap_days)
+
+        if "error" in result:
+            console.print(f"[red]{result['error']}[/red]")
+            for w in result.get("warnings", []):
+                console.print(f"[yellow]  {w}[/yellow]")
+            return
+
+        def _print_segment(label: str, agg: dict):
+            if not agg or agg.get("n_days", 0) == 0:
+                console.print(f"[dim]{label}: 評価対象日なし[/dim]")
+                return
+            console.print(f"\n[bold cyan]{label}[/bold cyan]")
+            console.print(f"  評価日数:               {agg['n_days']}日")
+            console.print(f"  実際の5R全的中率:       {agg['actual_hit_rate']:.2%}")
+            console.print(f"  予測hit確率 (top1積):   {agg['mean_predicted_hit_prob']:.5f}")
+            console.print(f"  正解馬の予測確率 (積):  {agg['mean_winner_predicted_prob']:.5f}")
+            console.print(f"  レッグ単位 top1的中:    {agg['leg_top1_hit_rate']:.2%}")
+            console.print(f"  平均的中レッグ数/日:    {agg['mean_leg_hits_per_day']:.2f}/5")
+
+        _print_segment("全期間", result["overall"])
+        _print_segment(f"制度変更前 (〜{result['regime_split_date']})", result["pre_regime_change"])
+        _print_segment(f"制度変更後 ({result['regime_split_date']}〜)", result["post_regime_change"])
+
+        warnings = result.get("warnings") or []
+        if warnings:
+            console.print(f"\n[yellow]警告 ({len(warnings)}件):[/yellow]")
+            for w in warnings[:10]:
+                console.print(f"[yellow]  - {w}[/yellow]")
+            if len(warnings) > 10:
+                console.print(f"[dim]  ...他 {len(warnings)-10} 件[/dim]")
+
+        day_results = result.get("day_results") or []
+        if day_results and show_days > 0:
+            day_results_sorted = sorted(
+                day_results,
+                key=lambda d: (not d["hit"], -d["predicted_hit_prob"]),
+            )
+            table = Table(title=f"日次結果 (hit優先 / 上位 {min(show_days, len(day_results_sorted))}件)")
+            table.add_column("日付")
+            table.add_column("hit", justify="center")
+            table.add_column("予測hit確率", justify="right")
+            table.add_column("top1予想 → 実際", justify="left")
+            for d in day_results_sorted[:show_days]:
+                compare = " | ".join(
+                    f"{p}{'✓' if p == a else '×('+str(a)+')'}"
+                    for p, a in zip(d["top1_picks"], d["actual_winners"])
+                )
+                table.add_row(
+                    d["race_date"].isoformat(),
+                    "✓" if d["hit"] else "-",
+                    f"{d['predicted_hit_prob']:.5f}",
+                    compare,
+                )
+            console.print(table)
+    finally:
+        session.close()
+
+
 @cli.command("scrape-win5-targets")
 @click.option("--date", "target_date", default=None, help="対象日 (YYYY-MM-DD)")
 def scrape_win5_targets(target_date: str | None):

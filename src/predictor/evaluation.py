@@ -146,24 +146,13 @@ def evaluate_by_group(results_df: pd.DataFrame, group_key: str, session: Session
     return group_results
 
 
-def walk_forward_cv(session: Session, n_splits: int = 4, gap_days: int = 7) -> dict:
-    """ウォークフォワードCVでモデル評価
-
-    Args:
-        session: DBセッション
-        n_splits: fold数
-        gap_days: 学習期間と検証期間のギャップ日数
+def _prepare_training_df(session: Session) -> pd.DataFrame | None:
+    """全 finished レースから特徴量 DataFrame を構築 (label 付与)
 
     Returns:
-        dict: fold_results (各foldの指標), mean (平均), std (標準偏差)
+        columns: FEATURE_COLUMNS の一部 + race_id, race_date, horse_number, finish_position, label
+        データ不足の場合は None
     """
-    from datetime import timedelta
-
-    import lightgbm as lgb
-
-    from src.common.config import DECAY_HALF_LIFE_DAYS
-
-    # 全レースを日付順で取得
     races = (
         session.query(Race)
         .filter(Race.status == "finished")
@@ -171,44 +160,46 @@ def walk_forward_cv(session: Session, n_splits: int = 4, gap_days: int = 7) -> d
         .all()
     )
     if len(races) < 50:
-        return {"error": f"レース数不足 ({len(races)}/50)"}
+        return None
 
-    # レースごとに特徴量を構築
     all_dfs = []
-    race_date_map = {}
     for race in races:
         df = build_features_for_race(session, race)
         if not df.empty and "finish_position" in df.columns:
             df["race_id"] = race.id
             df["race_date"] = race.race_date
             all_dfs.append(df)
-            race_date_map[race.id] = race.race_date
 
     if not all_dfs:
-        return {"error": "有効なデータなし"}
+        return None
 
     full_df = pd.concat(all_dfs, ignore_index=True)
     max_pos = full_df["finish_position"].max()
     full_df["label"] = (max_pos + 1 - full_df["finish_position"]).clip(lower=0)
+    return full_df
 
-    # 日付のユニーク値からfold分割を決定
+
+def _iter_fold_splits(
+    full_df: pd.DataFrame, n_splits: int = 4, gap_days: int = 7,
+):
+    """walk-forward CV の fold 分割を生成
+
+    Yields:
+        (fold_i, train_df, valid_df) — 有効な fold のみ。fold_i は 0 始まり。
+    """
+    from datetime import timedelta
+
     unique_dates = sorted(full_df["race_date"].unique())
     n_dates = len(unique_dates)
-    # 検証期間は全体の約20%をn_splitsで分割
     valid_size = max(1, n_dates // (n_splits + 4))
 
-    fold_results = []
-
     for fold_i in range(n_splits):
-        # 検証期間の開始位置: 後半部分をn_splits等分
         valid_start_idx = n_dates - (n_splits - fold_i) * valid_size
         valid_end_idx = valid_start_idx + valid_size
         if valid_start_idx < 1:
             continue
 
         valid_dates = set(unique_dates[valid_start_idx:valid_end_idx])
-
-        # gap_days前までを学習データとする
         gap_threshold = min(valid_dates) - timedelta(days=gap_days)
         train_dates = set(d for d in unique_dates[:valid_start_idx] if d <= gap_threshold)
 
@@ -221,76 +212,176 @@ def walk_forward_cv(session: Session, n_splits: int = 4, gap_days: int = 7) -> d
         if len(train_df) < 30 or len(valid_df) < 10:
             continue
 
-        # 時間減衰重み
-        reference_date = max(train_dates)
-        train_df["sample_weight"] = train_df["race_date"].apply(
-            lambda d: np.exp(
-                -np.log(2) * (reference_date - d).days / DECAY_HALF_LIFE_DAYS
-            )
+        yield fold_i, train_df, valid_df
+
+
+def _train_and_predict_fold(
+    train_df: pd.DataFrame,
+    valid_df: pd.DataFrame,
+    feature_cols: list[str],
+    n_seeds: int = 3,
+) -> np.ndarray:
+    """1 fold 分の LambdaRank seedアンサンブル学習 + valid予測
+
+    Returns:
+        valid_df の行順と一致する pred_score の np.ndarray
+    """
+    import lightgbm as lgb
+
+    from src.common.config import DECAY_HALF_LIFE_DAYS
+
+    reference_date = train_df["race_date"].max()
+    train_df = train_df.copy()
+    train_df["sample_weight"] = train_df["race_date"].apply(
+        lambda d: np.exp(
+            -np.log(2) * (reference_date - d).days / DECAY_HALF_LIFE_DAYS
         )
+    )
 
-        available_cols = [c for c in FEATURE_COLUMNS if c in train_df.columns]
+    X_train = train_df[feature_cols].fillna(0)
+    y_train = train_df["label"]
+    w_train = train_df["sample_weight"]
+    group_train = train_df.groupby("race_id").size().tolist()
 
-        X_train = train_df[available_cols].fillna(0)
-        y_train = train_df["label"]
-        w_train = train_df["sample_weight"]
-        group_train = train_df.groupby("race_id").size().tolist()
+    X_valid = valid_df[feature_cols].fillna(0)
+    y_valid = valid_df["label"]
+    group_valid = valid_df.groupby("race_id").size().tolist()
 
-        X_valid = valid_df[available_cols].fillna(0)
-        y_valid = valid_df["label"]
-        group_valid = valid_df.groupby("race_id").size().tolist()
+    max_pos = int(train_df["finish_position"].max())
+    n_labels = max_pos + 1
+    label_gain = [0.0] * n_labels
+    for i in range(n_labels):
+        pos = max_pos - i
+        if pos <= 0:
+            label_gain[i] = 100.0
+        elif pos == 1:
+            label_gain[i] = 10.0
+        elif pos == 2:
+            label_gain[i] = 5.0
+        else:
+            label_gain[i] = max(0.0, 3.0 - pos * 0.1)
 
-        # LightGBM LambdaRank (label_gain + seedアンサンブル)
-        max_pos = int(train_df["finish_position"].max())
-        n_labels = max_pos + 1
-        label_gain = [0.0] * n_labels
-        for i in range(n_labels):
-            pos = max_pos - i
-            if pos <= 0:
-                label_gain[i] = 100.0
-            elif pos == 1:
-                label_gain[i] = 10.0
-            elif pos == 2:
-                label_gain[i] = 5.0
-            else:
-                label_gain[i] = max(0.0, 3.0 - pos * 0.1)
+    base_params = {
+        "objective": "lambdarank",
+        "metric": "ndcg",
+        "ndcg_eval_at": [1, 3],
+        "label_gain": label_gain,
+        "lambdarank_truncation_level": 5,
+        "learning_rate": 0.02,
+        "num_leaves": 63,
+        "min_data_in_leaf": max(50, len(train_df) // 60),
+        "feature_fraction": 0.75,
+        "bagging_fraction": 0.8,
+        "bagging_freq": 3,
+        "lambda_l1": 0.5,
+        "lambda_l2": 5.0,
+        "min_gain_to_split": 0.05,
+        "n_estimators": 2000,
+        "verbose": -1,
+    }
 
-        base_params = {
-            "objective": "lambdarank",
-            "metric": "ndcg",
-            "ndcg_eval_at": [1, 3],
-            "label_gain": label_gain,
-            "lambdarank_truncation_level": 5,
-            "learning_rate": 0.02,
-            "num_leaves": 63,
-            "min_data_in_leaf": max(50, len(train_df) // 60),
-            "feature_fraction": 0.75,
-            "bagging_fraction": 0.8,
-            "bagging_freq": 3,
-            "lambda_l1": 0.5,
-            "lambda_l2": 5.0,
-            "min_gain_to_split": 0.05,
-            "n_estimators": 2000,
-            "verbose": -1,
-        }
+    seed_scores = []
+    for seed in range(n_seeds):
+        params = {**base_params, "random_state": seed * 42 + 7}
+        ranker = lgb.LGBMRanker(**params)
+        callbacks = [lgb.early_stopping(100, verbose=False)]
+        ranker.fit(
+            X_train, y_train, group=group_train,
+            sample_weight=w_train,
+            eval_set=[(X_valid, y_valid)],
+            eval_group=[group_valid],
+            callbacks=callbacks,
+        )
+        seed_scores.append(ranker.predict(X_valid))
 
-        # seedアンサンブル: 3モデル(evaluateは速度重視で少なめ)
-        seed_scores = []
-        for seed in range(3):
-            params = {**base_params, "random_state": seed * 42 + 7}
-            ranker = lgb.LGBMRanker(**params)
-            callbacks = [lgb.early_stopping(100, verbose=False)]
-            ranker.fit(
-                X_train, y_train, group=group_train,
-                sample_weight=w_train,
-                eval_set=[(X_valid, y_valid)],
-                eval_group=[group_valid],
-                callbacks=callbacks,
-            )
-            seed_scores.append(ranker.predict(X_valid))
+    return np.mean(seed_scores, axis=0)
 
-        # 予測（seedアンサンブルの平均）
-        valid_df["pred_score"] = np.mean(seed_scores, axis=0)
+
+def _softmax_within_race(pred_scores: np.ndarray) -> np.ndarray:
+    """レース内 softmax で win probability を生成
+
+    LambdaRank のスコアを1着確率に変換する Luce's choice model の近似。
+    Isotonic キャリブレーションの代替として、フォールド内で完結して使える。
+    """
+    s = pred_scores - pred_scores.max()
+    exps = np.exp(s)
+    total = exps.sum()
+    if total <= 0:
+        n = len(pred_scores)
+        return np.ones(n) / n if n > 0 else pred_scores
+    return exps / total
+
+
+def produce_oof_predictions(
+    session: Session,
+    n_splits: int = 4,
+    gap_days: int = 7,
+    n_seeds: int = 3,
+) -> pd.DataFrame:
+    """walk-forward CV で race-level OOF 予測を生成
+
+    walk_forward_cv と同じ学習パイプラインを使うが、指標計算ではなく
+    race×horse の予測スコアを返す。Win5Evaluator など日次集約の入力として使う。
+
+    Returns:
+        columns: race_id, race_date, horse_number, pred_score,
+                 pred_win_prob_softmax, finish_position, fold
+        データ不足時は空 DataFrame
+    """
+    full_df = _prepare_training_df(session)
+    if full_df is None:
+        return pd.DataFrame()
+
+    available_cols = [c for c in FEATURE_COLUMNS if c in full_df.columns]
+    oof_parts = []
+
+    for fold_i, train_df, valid_df in _iter_fold_splits(full_df, n_splits, gap_days):
+        scores = _train_and_predict_fold(train_df, valid_df, available_cols, n_seeds=n_seeds)
+        valid_df = valid_df.copy()
+        valid_df["pred_score"] = scores
+        valid_df["fold"] = fold_i + 1
+        valid_df["pred_win_prob_softmax"] = (
+            valid_df.groupby("race_id")["pred_score"]
+            .transform(lambda s: _softmax_within_race(s.values))
+        )
+        oof_parts.append(valid_df[[
+            "race_id", "race_date", "horse_number", "pred_score",
+            "pred_win_prob_softmax", "finish_position", "fold",
+        ]])
+
+    if not oof_parts:
+        return pd.DataFrame()
+    return pd.concat(oof_parts, ignore_index=True)
+
+
+def walk_forward_cv(session: Session, n_splits: int = 4, gap_days: int = 7) -> dict:
+    """ウォークフォワードCVでモデル評価
+
+    Args:
+        session: DBセッション
+        n_splits: fold数
+        gap_days: 学習期間と検証期間のギャップ日数
+
+    Returns:
+        dict: fold_results (各foldの指標), mean (平均), std (標準偏差)
+    """
+    full_df = _prepare_training_df(session)
+    if full_df is None:
+        # 元メッセージ互換のため: レース不足か有効データなしかを区別
+        races_count = (
+            session.query(Race).filter(Race.status == "finished").count()
+        )
+        if races_count < 50:
+            return {"error": f"レース数不足 ({races_count}/50)"}
+        return {"error": "有効なデータなし"}
+
+    available_cols = [c for c in FEATURE_COLUMNS if c in full_df.columns]
+    fold_results = []
+
+    for fold_i, train_df, valid_df in _iter_fold_splits(full_df, n_splits, gap_days):
+        scores = _train_and_predict_fold(train_df, valid_df, available_cols, n_seeds=3)
+        valid_df = valid_df.copy()
+        valid_df["pred_score"] = scores
 
         # オッズ情報を付加
         odds_map = {}
@@ -308,8 +399,8 @@ def walk_forward_cv(session: Session, n_splits: int = 4, gap_days: int = 7) -> d
 
         metrics = evaluate_predictions(valid_df, session=session)
         metrics["fold"] = fold_i + 1
-        metrics["n_train_dates"] = len(train_dates)
-        metrics["n_valid_dates"] = len(valid_dates)
+        metrics["n_train_dates"] = train_df["race_date"].nunique()
+        metrics["n_valid_dates"] = valid_df["race_date"].nunique()
         fold_results.append(metrics)
 
     if not fold_results:
