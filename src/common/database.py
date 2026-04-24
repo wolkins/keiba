@@ -102,7 +102,7 @@ class RaceEntry(Base):
     horse_weight = Column(Integer)    # 馬体重
     weight_diff = Column(Integer)     # 馬体重増減
     popularity = Column(Integer)      # 人気
-    odds_win = Column(Float)          # 単勝オッズ
+    odds_win = Column(Float)          # 単勝オッズ (注意: 締切時点の最終値。学習時のリーク元になる可能性あり。時系列整合の厳密な用途では OddsSnapshot を as_of 指定で参照すること)
 
     # 結果
     finish_position = Column(Integer)
@@ -122,7 +122,11 @@ class RaceEntry(Base):
 
 
 class Odds(Base):
-    """オッズ"""
+    """オッズ (最新値キャッシュ)
+
+    注意: 同一 (race_id, bet_type, combination) は上書きされ、最後の captured_at の値しか残らない。
+    時系列整合が必要な用途 (WIN5 評価, バックテスト) では OddsSnapshot を参照すること。
+    """
     __tablename__ = "odds"
 
     id = Column(Integer, primary_key=True)
@@ -136,6 +140,71 @@ class Odds(Base):
 
     __table_args__ = (
         UniqueConstraint("race_id", "bet_type", "combination", name="uq_odds"),
+    )
+
+
+class OddsSnapshot(Base):
+    """オッズ時系列スナップショット (append-only)
+
+    スクレイプ毎に追記し、as_of 時点の市場確率評価・バックテストに使用する。
+    """
+    __tablename__ = "odds_snapshots"
+
+    id = Column(Integer, primary_key=True)
+    race_id = Column(Integer, ForeignKey("races.id"), nullable=False)
+    bet_type = Column(String(20), nullable=False)
+    combination = Column(String(30), nullable=False)
+    odds_value = Column(Float, nullable=False)
+    captured_at = Column(DateTime, nullable=False, default=datetime.now, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "race_id", "bet_type", "combination", "captured_at",
+            name="uq_odds_snapshot",
+        ),
+    )
+
+
+WIN5_TARGET_SOURCE_JRA = "jra"
+WIN5_TARGET_STATUS_SCHEDULED = "scheduled"
+WIN5_TARGET_STATUS_CONFIRMED = "confirmed"
+WIN5_TARGET_STATUS_CANCELLED = "cancelled"
+
+
+class Win5TargetRace(Base):
+    """WIN5対象5レース (official only)
+
+    JRA 公式の対象レース一覧から取り込む。
+    ヒューリスティック推定行は保存しない (誤発注事故防止のため)。
+    Race への紐付け (race_id) は後から解決してよい。
+    """
+    __tablename__ = "win5_target_races"
+
+    id = Column(Integer, primary_key=True)
+    race_date = Column(Date, nullable=False, index=True)
+    leg_index = Column(Integer, nullable=False)  # 1..5
+
+    # JRA 公式から得られる一次情報
+    racecourse_code = Column(String(4), nullable=True)   # "05" 等。名称からの変換値
+    racecourse_name = Column(String(50), nullable=False) # "東京" 等 (JRA表記そのまま)
+    race_number = Column(Integer, nullable=False)
+    post_time = Column(String(10), nullable=True)        # "14時50分"
+    close_time = Column(String(10), nullable=True)       # WIN5締切時刻
+
+    # Race との紐付け (スクレイピング未取得時は null)
+    race_id = Column(Integer, ForeignKey("races.id"), nullable=True)
+
+    source = Column(String(20), nullable=False, default=WIN5_TARGET_SOURCE_JRA)
+    source_url = Column(String(255), nullable=True)
+    status = Column(String(20), nullable=False, default=WIN5_TARGET_STATUS_SCHEDULED)
+
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    race = relationship("Race")
+
+    __table_args__ = (
+        UniqueConstraint("race_date", "leg_index", name="uq_win5_target_date_leg"),
     )
 
 

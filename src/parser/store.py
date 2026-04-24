@@ -1,10 +1,13 @@
 """スクレイピングデータをDBに格納するパーサー (中央競馬)"""
 from datetime import datetime
 
+from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
 
 from src.common.database import (
-    Horse, Jockey, Odds, Race, RaceEntry, Racecourse, get_session,
+    Horse, Jockey, Odds, OddsSnapshot, Race, RaceEntry, Racecourse,
+    Win5TargetRace, WIN5_TARGET_SOURCE_JRA, WIN5_TARGET_STATUS_SCHEDULED,
+    get_session,
 )
 
 
@@ -209,30 +212,219 @@ def _upsert_jockey(session: Session, entry_data: dict) -> Jockey | None:
 def store_odds(session: Session, race: Race, odds_list: list[dict]):
     """オッズデータをDBに格納
 
+    Odds (最新値) を upsert しつつ、OddsSnapshot に同時点のスナップショットを append する。
+    同一 captured_at の重複書き込みは握り潰す。
+
     Args:
         session: SQLAlchemy Session
         race: Race オブジェクト
         odds_list: [{"bet_type": "win", "combination": "5", "odds_value": 2.5}, ...]
     """
+    captured_at = datetime.now()
+
     for o in odds_list:
         if not o.get("combination") or o.get("odds_value") is None:
             continue
 
+        bet_type = o.get("bet_type", "")
+        combination = o["combination"]
+        odds_value = o["odds_value"]
+
         existing = session.query(Odds).filter_by(
             race_id=race.id,
-            bet_type=o.get("bet_type", ""),
-            combination=o["combination"],
+            bet_type=bet_type,
+            combination=combination,
         ).first()
 
         if not existing:
             session.add(Odds(
                 race_id=race.id,
-                bet_type=o.get("bet_type", ""),
-                combination=o["combination"],
-                odds_value=o["odds_value"],
+                bet_type=bet_type,
+                combination=combination,
+                odds_value=odds_value,
+                captured_at=captured_at,
             ))
         else:
-            existing.odds_value = o["odds_value"]
-            existing.captured_at = datetime.now()
+            existing.odds_value = odds_value
+            existing.captured_at = captured_at
+
+        snapshot_exists = session.query(OddsSnapshot).filter_by(
+            race_id=race.id,
+            bet_type=bet_type,
+            combination=combination,
+            captured_at=captured_at,
+        ).first()
+        if not snapshot_exists:
+            session.add(OddsSnapshot(
+                race_id=race.id,
+                bet_type=bet_type,
+                combination=combination,
+                odds_value=odds_value,
+                captured_at=captured_at,
+            ))
 
     session.commit()
+
+
+def store_win5_target_races(
+    session: Session,
+    targets: list[dict],
+) -> list[Win5TargetRace]:
+    """WIN5 対象5レースを DB に保存 (upsert)
+
+    Args:
+        session: SQLAlchemy Session
+        targets: Win5Scraper.scrape_target_races() の戻り値形式
+
+    Returns:
+        保存 (or 更新) された Win5TargetRace のリスト
+    """
+    saved = []
+    for t in targets:
+        race_date = t["race_date"]
+        if isinstance(race_date, str):
+            race_date = datetime.strptime(race_date, "%Y-%m-%d").date()
+
+        existing = session.query(Win5TargetRace).filter_by(
+            race_date=race_date,
+            leg_index=t["leg_index"],
+        ).first()
+
+        # Race 内部PK の解決 (race_date + racecourse_code + race_number で突合)
+        race_pk = None
+        if t.get("racecourse_code"):
+            racecourse = session.query(Racecourse).filter_by(code=t["racecourse_code"]).first()
+            if racecourse:
+                race = session.query(Race).filter_by(
+                    race_date=race_date,
+                    racecourse_id=racecourse.id,
+                    race_number=t["race_number"],
+                ).first()
+                if race:
+                    race_pk = race.id
+
+        if not existing:
+            target = Win5TargetRace(
+                race_date=race_date,
+                leg_index=t["leg_index"],
+                racecourse_name=t["racecourse_name"],
+                racecourse_code=t.get("racecourse_code"),
+                race_number=t["race_number"],
+                post_time=t.get("post_time"),
+                close_time=t.get("close_time"),
+                race_id=race_pk,
+                source=t.get("source", WIN5_TARGET_SOURCE_JRA),
+                source_url=t.get("source_url"),
+                status=WIN5_TARGET_STATUS_SCHEDULED,
+            )
+            session.add(target)
+            saved.append(target)
+        else:
+            existing.racecourse_name = t["racecourse_name"]
+            existing.racecourse_code = t.get("racecourse_code") or existing.racecourse_code
+            existing.race_number = t["race_number"]
+            existing.post_time = t.get("post_time") or existing.post_time
+            existing.close_time = t.get("close_time") or existing.close_time
+            if race_pk is not None:
+                existing.race_id = race_pk
+            existing.source = t.get("source", existing.source)
+            existing.source_url = t.get("source_url") or existing.source_url
+            saved.append(existing)
+
+    session.commit()
+    return saved
+
+
+def resolve_win5_race_links(session: Session, race_date) -> int:
+    """Win5TargetRace のうち race_id 未解決の行について、Race との紐付けを試みる
+
+    スクレイプ当時に Race が未取得でも、後から race データを scrape した後に
+    このヘルパを呼べば紐付けが埋まる。
+
+    Returns:
+        新規に紐付けに成功した件数
+    """
+    if isinstance(race_date, str):
+        race_date = datetime.strptime(race_date, "%Y-%m-%d").date()
+
+    targets = session.query(Win5TargetRace).filter(
+        Win5TargetRace.race_date == race_date,
+        Win5TargetRace.race_id.is_(None),
+    ).all()
+
+    resolved = 0
+    for t in targets:
+        if not t.racecourse_code:
+            continue
+        racecourse = session.query(Racecourse).filter_by(code=t.racecourse_code).first()
+        if not racecourse:
+            continue
+        race = session.query(Race).filter_by(
+            race_date=race_date,
+            racecourse_id=racecourse.id,
+            race_number=t.race_number,
+        ).first()
+        if race:
+            t.race_id = race.id
+            resolved += 1
+
+    if resolved:
+        session.commit()
+    return resolved
+
+
+def get_odds_snapshot(
+    session: Session,
+    race_id: int,
+    bet_type: str = "win",
+    as_of: datetime | None = None,
+) -> dict[str, float]:
+    """as_of 時点での最新オッズスナップショットを返す
+
+    同一 (race_id, bet_type, combination) について captured_at <= as_of の中で
+    最大の captured_at を持つ行を採用する。
+    as_of=None の場合は全期間中の最新。
+
+    Args:
+        session: SQLAlchemy Session
+        race_id: Race.id (内部 PK)
+        bet_type: "win" / "place" 等
+        as_of: 基準時刻。None なら最新。
+
+    Returns:
+        {"1": 3.2, "5": 12.5, ...}  combination -> odds_value
+    """
+    filters = [
+        OddsSnapshot.race_id == race_id,
+        OddsSnapshot.bet_type == bet_type,
+    ]
+    if as_of is not None:
+        filters.append(OddsSnapshot.captured_at <= as_of)
+
+    latest_at = (
+        session.query(
+            OddsSnapshot.combination.label("combination"),
+            func.max(OddsSnapshot.captured_at).label("latest_at"),
+        )
+        .filter(and_(*filters))
+        .group_by(OddsSnapshot.combination)
+        .subquery()
+    )
+
+    rows = (
+        session.query(OddsSnapshot)
+        .join(
+            latest_at,
+            and_(
+                OddsSnapshot.combination == latest_at.c.combination,
+                OddsSnapshot.captured_at == latest_at.c.latest_at,
+            ),
+        )
+        .filter(
+            OddsSnapshot.race_id == race_id,
+            OddsSnapshot.bet_type == bet_type,
+        )
+        .all()
+    )
+
+    return {row.combination: row.odds_value for row in rows}

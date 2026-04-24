@@ -16,9 +16,15 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-from src.common.database import Race, RaceEntry, Racecourse, get_session, init_db, seed_racecourses
-from src.parser.store import store_odds, store_race_result
+from src.common.database import (
+    Race, RaceEntry, Racecourse, Win5TargetRace,
+    get_session, init_db, seed_racecourses,
+)
+from src.parser.store import (
+    resolve_win5_race_links, store_odds, store_race_result, store_win5_target_races,
+)
 from src.predictor.model import KeibaPredictor
+from src.scraper.jra_win5 import Win5Scraper
 from src.scraper.netkeiba import NetkeibaScraper
 
 console = Console()
@@ -521,6 +527,118 @@ def status():
     console.print(table)
     console.print()
     session.close()
+
+
+@cli.command("scrape-win5-targets")
+@click.option("--date", "target_date", default=None, help="対象日 (YYYY-MM-DD)")
+def scrape_win5_targets(target_date: str | None):
+    """JRA 公式から WIN5 対象5レースを取得して DB に保存
+
+    ヒューリスティック推定は行わない。対象日が JRA 公式の掲載期間外であれば
+    何も保存されない。
+    """
+    if target_date is None:
+        target_date = date.today().isoformat()
+
+    console.print(f"\n[bold blue]WIN5対象レース取得: {target_date}[/bold blue]\n")
+
+    scraper = Win5Scraper()
+    session = get_session()
+
+    try:
+        targets = scraper.scrape_target_races(target_date)
+        if not targets:
+            console.print(f"[yellow]{target_date} の WIN5 対象レースが JRA 公式に見つかりません。[/yellow]")
+            console.print("[dim]非開催日か、JRA公式の掲載期間外の可能性があります。[/dim]")
+            return
+
+        saved = store_win5_target_races(session, targets)
+        console.print(f"[green]{len(saved)}件 保存/更新しました[/green]\n")
+
+        table = Table(title=f"WIN5 対象レース ({target_date})")
+        table.add_column("leg", justify="right")
+        table.add_column("競馬場")
+        table.add_column("R", justify="right")
+        table.add_column("発走")
+        table.add_column("締切")
+        table.add_column("Race連携", justify="center")
+        for t in saved:
+            table.add_row(
+                str(t.leg_index),
+                t.racecourse_name,
+                str(t.race_number),
+                t.post_time or "-",
+                t.close_time or "-",
+                "✓" if t.race_id else "-",
+            )
+        console.print(table)
+
+        unresolved = sum(1 for t in saved if not t.race_id)
+        if unresolved:
+            console.print(
+                f"\n[yellow]{unresolved}件が Race テーブル未登録です。"
+                f" `scrape --date {target_date}` 後に `inspect-win5-targets` で再解決できます。[/yellow]"
+            )
+    finally:
+        session.close()
+
+
+@cli.command("inspect-win5-targets")
+@click.option("--date", "target_date", default=None, help="対象日 (YYYY-MM-DD)")
+@click.option("--resolve", is_flag=True, help="Race との紐付けを再試行")
+def inspect_win5_targets(target_date: str | None, resolve: bool):
+    """DB に登録済みの WIN5 対象5レースを表示"""
+    if target_date is None:
+        target_date = date.today().isoformat()
+
+    session = get_session()
+    try:
+        dt = datetime.strptime(target_date, "%Y-%m-%d").date()
+
+        if resolve:
+            n = resolve_win5_race_links(session, dt)
+            console.print(f"[cyan]Race 紐付け再解決: {n}件[/cyan]\n")
+
+        targets = (
+            session.query(Win5TargetRace)
+            .filter(Win5TargetRace.race_date == dt)
+            .order_by(Win5TargetRace.leg_index)
+            .all()
+        )
+
+        if not targets:
+            console.print(f"[yellow]{target_date} の WIN5 対象レースは DB に未登録です。[/yellow]")
+            console.print(f"[dim]先に `scrape-win5-targets --date {target_date}` を実行してください。[/dim]")
+            return
+
+        table = Table(title=f"WIN5 対象レース ({target_date})")
+        table.add_column("leg", justify="right")
+        table.add_column("競馬場")
+        table.add_column("code")
+        table.add_column("R", justify="right")
+        table.add_column("発走")
+        table.add_column("締切")
+        table.add_column("source")
+        table.add_column("status")
+        table.add_column("Race連携", justify="center")
+        for t in targets:
+            table.add_row(
+                str(t.leg_index),
+                t.racecourse_name,
+                t.racecourse_code or "?",
+                str(t.race_number),
+                t.post_time or "-",
+                t.close_time or "-",
+                t.source,
+                t.status,
+                "✓" if t.race_id else "-",
+            )
+        console.print(table)
+
+        if len(targets) != 5:
+            console.print(f"\n[red]WIN5 対象が 5件ではありません ({len(targets)}件)。再取得を検討してください。[/red]")
+    finally:
+        session.close()
 
 
 @cli.command()

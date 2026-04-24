@@ -357,6 +357,11 @@ class KeibaPredictor:
                 "calibrated_top3_prob": round(top3_prob, 4),
                 "expected_value": round(expected_value, 4) if expected_value else None,
                 "recommendation": self._get_recommendation(score),
+                # 丸めなし (WIN5 等の確率積で情報落ちを避けるため)
+                "raw_score": final_score,
+                "raw_probability": score,
+                "raw_win_prob": win_prob,
+                "raw_top3_prob": top3_prob,
             })
 
         results.sort(key=lambda x: x["score"], reverse=True)
@@ -389,6 +394,7 @@ class KeibaPredictor:
                 if jockey:
                     jockey_name = jockey.name
 
+            raw_prob = max(0.0, min(1.0, score / 100))
             results.append({
                 "horse_number": entry.horse_number,
                 "horse_name": horse_name,
@@ -397,11 +403,15 @@ class KeibaPredictor:
                 "weight_carry": weight_carry,
                 "odds": entry.odds_win or 0,
                 "score": round(score, 4),
-                "probability": round(max(0, min(1, score / 100)), 4),
+                "probability": round(raw_prob, 4),
                 "calibrated_win_prob": 0.0,
                 "calibrated_top3_prob": 0.0,
                 "expected_value": None,
-                "recommendation": self._get_recommendation(max(0, min(1, score / 100))),
+                "recommendation": self._get_recommendation(raw_prob),
+                "raw_score": score,
+                "raw_probability": raw_prob,
+                "raw_win_prob": 0.0,
+                "raw_top3_prob": 0.0,
             })
 
         results.sort(key=lambda x: x["score"], reverse=True)
