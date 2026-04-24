@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from src.common.database import (
     Horse, Jockey, Odds, OddsSnapshot, Race, RaceEntry, Racecourse,
-    Win5Run, Win5TargetRace,
+    Win5PayoutHistory, Win5Run, Win5TargetRace,
     WIN5_OPTIMIZER_VERSION, WIN5_RUN_MODE_HIT, WIN5_TARGET_SOURCE_JRA,
     WIN5_TARGET_STATUS_SCHEDULED, WIN5_UNIT_PRICE,
     get_session,
@@ -374,6 +374,71 @@ def resolve_win5_race_links(session: Session, race_date) -> int:
     if resolved:
         session.commit()
     return resolved
+
+
+def store_win5_payout_history(
+    session: Session,
+    record: dict,
+) -> Win5PayoutHistory:
+    """WIN5 払戻履歴を1件 upsert (race_date UNIQUE)
+
+    Args:
+        record: 以下のキーを受け付ける (全て optional, race_date は必須)
+            race_date (str or date) 必須
+            winning_combination: "3-7-12-5-9"
+            race_ids: [int, int, int, int, int]
+            total_sales: int
+            winning_tickets: int
+            payout_per_ticket: int
+            carryover_in: int
+            carryover_out: int
+            jackpot_flag: bool
+            source: str (default "manual")
+            source_url: str
+            notes: str
+    """
+    race_date = record.get("race_date")
+    if race_date is None:
+        raise ValueError("race_date is required")
+    if isinstance(race_date, str):
+        race_date = datetime.strptime(race_date, "%Y-%m-%d").date()
+
+    existing = session.query(Win5PayoutHistory).filter_by(race_date=race_date).first()
+    race_ids_json = (
+        json.dumps(record["race_ids"])
+        if record.get("race_ids") is not None else None
+    )
+
+    if existing:
+        for field in [
+            "winning_combination", "total_sales", "winning_tickets",
+            "payout_per_ticket", "carryover_in", "carryover_out",
+            "jackpot_flag", "source", "source_url", "notes",
+        ]:
+            if field in record and record[field] is not None:
+                setattr(existing, field, record[field])
+        if race_ids_json is not None:
+            existing.race_ids_json = race_ids_json
+        row = existing
+    else:
+        row = Win5PayoutHistory(
+            race_date=race_date,
+            winning_combination=record.get("winning_combination"),
+            race_ids_json=race_ids_json,
+            total_sales=record.get("total_sales"),
+            winning_tickets=record.get("winning_tickets"),
+            payout_per_ticket=record.get("payout_per_ticket"),
+            carryover_in=record.get("carryover_in", 0),
+            carryover_out=record.get("carryover_out", 0),
+            jackpot_flag=record.get("jackpot_flag", False),
+            source=record.get("source", "manual"),
+            source_url=record.get("source_url"),
+            notes=record.get("notes"),
+        )
+        session.add(row)
+
+    session.commit()
+    return row
 
 
 def store_win5_run(

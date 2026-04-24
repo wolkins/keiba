@@ -209,8 +209,10 @@ class Win5TargetRace(Base):
 
 
 WIN5_RUN_MODE_HIT = "hit"
+WIN5_RUN_MODE_EV = "ev"
 WIN5_OPTIMIZER_VERSION = "v1"
 WIN5_UNIT_PRICE = 200
+WIN5_POOL_RATE = 0.7  # JRA WIN5 払戻率
 
 
 class Win5Run(Base):
@@ -241,6 +243,42 @@ class Win5Run(Base):
     target_races_json = Column(Text, nullable=False)         # list[{leg_index, racecourse_code, race_number, race_id}]
 
     created_at = Column(DateTime, default=datetime.now)
+
+
+class Win5PayoutHistory(Base):
+    """WIN5 過去払戻履歴 (manual entry 前提)
+
+    JRA 公式は完全な払戻履歴を構造化データで公開していないため、手動入力 or
+    半自動スクレイプ (キャリーオーバー発生日のみ) で蓄積する。
+    配当モデル v2 (回帰学習) の教師データとして使用する。
+    """
+    __tablename__ = "win5_payout_history"
+
+    id = Column(Integer, primary_key=True)
+    race_date = Column(Date, nullable=False, unique=True, index=True)
+
+    # 5R 勝ち馬組合せ (例: "3-7-12-5-9")
+    winning_combination = Column(String(40), nullable=True)
+    # 5R の race_id を JSON 配列で保持 (例: [123, 124, 125, 126, 127])
+    race_ids_json = Column(Text, nullable=True)
+
+    # 売上・票数・払戻
+    total_sales = Column(Integer, nullable=True)           # 発売金額(円)
+    winning_tickets = Column(Integer, nullable=True)       # 的中票数
+    payout_per_ticket = Column(Integer, nullable=True)     # 1票あたり払戻金(円)
+
+    # キャリーオーバー
+    carryover_in = Column(Integer, nullable=True, default=0)    # 当日持越金
+    carryover_out = Column(Integer, nullable=True, default=0)   # 次週へ持越
+    jackpot_flag = Column(Boolean, default=False)               # キャリーオーバー到達時True
+
+    # メタ
+    source = Column(String(20), nullable=False, default="manual")  # manual / jra / inferred
+    source_url = Column(String(255), nullable=True)
+    notes = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
 
 class PredictionResult(Base):

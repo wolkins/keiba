@@ -17,12 +17,12 @@ from rich.panel import Panel
 from rich.table import Table
 
 from src.common.database import (
-    Race, RaceEntry, Racecourse, Win5Run, Win5TargetRace,
+    Race, RaceEntry, Racecourse, Win5PayoutHistory, Win5Run, Win5TargetRace,
     get_session, init_db, seed_racecourses,
 )
 from src.parser.store import (
     resolve_win5_race_links, store_odds, store_race_result,
-    store_win5_run, store_win5_target_races,
+    store_win5_payout_history, store_win5_run, store_win5_target_races,
 )
 from src.predictor.model import KeibaPredictor
 from src.scraper.jra_win5 import Win5Scraper
@@ -530,22 +530,116 @@ def status():
     session.close()
 
 
+@cli.command("import-win5-history")
+@click.option("--file", "file_path", required=True, help="JSON ファイル (list of records)")
+@click.option("--dry-run", is_flag=True, help="保存せず件数だけ確認")
+def import_win5_history(file_path: str, dry_run: bool):
+    """WIN5 払戻履歴を JSON ファイルから import (manual entry)
+
+    ファイル形式 (list of records):
+      [
+        {
+          "race_date": "2026-02-01",
+          "winning_combination": "7-2-5-16-6",
+          "race_ids": [12345, 12346, 12347, 12348, 12349],
+          "total_sales": 425000000,
+          "winning_tickets": 0,
+          "payout_per_ticket": 0,
+          "carryover_in": 539905240,
+          "carryover_out": 0,
+          "jackpot_flag": true,
+          "source": "manual",
+          "notes": "第xx回..."
+        },
+        ...
+      ]
+    """
+    import json as _json
+    from pathlib import Path
+
+    p = Path(file_path)
+    if not p.exists():
+        console.print(f"[red]ファイルが見つかりません: {file_path}[/red]")
+        return
+    try:
+        records = _json.loads(p.read_text(encoding="utf-8"))
+    except _json.JSONDecodeError as e:
+        console.print(f"[red]JSON パースエラー: {e}[/red]")
+        return
+
+    if not isinstance(records, list):
+        console.print("[red]JSON ルートは list である必要があります[/red]")
+        return
+
+    console.print(f"\n[bold blue]WIN5 履歴 import ({len(records)}件)[/bold blue]\n")
+    if dry_run:
+        table = Table(title="(dry-run)")
+        table.add_column("race_date")
+        table.add_column("winning_combination")
+        table.add_column("total_sales", justify="right")
+        table.add_column("winning_tickets", justify="right")
+        table.add_column("payout", justify="right")
+        table.add_column("carryover_out", justify="right")
+        for r in records[:20]:
+            table.add_row(
+                str(r.get("race_date", "?")),
+                r.get("winning_combination", "-") or "-",
+                f"{r.get('total_sales', 0):,}" if r.get("total_sales") else "-",
+                f"{r.get('winning_tickets', 0):,}" if r.get("winning_tickets") is not None else "-",
+                f"{r.get('payout_per_ticket', 0):,}" if r.get("payout_per_ticket") else "-",
+                f"{r.get('carryover_out', 0):,}" if r.get("carryover_out") else "-",
+            )
+        console.print(table)
+        if len(records) > 20:
+            console.print(f"[dim]...他 {len(records)-20}件[/dim]")
+        return
+
+    session = get_session()
+    saved = 0
+    errors = 0
+    try:
+        for r in records:
+            try:
+                store_win5_payout_history(session, r)
+                saved += 1
+            except Exception as e:
+                console.print(f"[red]error race_date={r.get('race_date')}: {e}[/red]")
+                errors += 1
+        console.print(f"[green]{saved}件保存[/green]" + (f" / [red]{errors}件エラー[/red]" if errors else ""))
+    finally:
+        session.close()
+
+
 @cli.command("predict-win5")
 @click.option("--date", "target_date", default=None, help="対象日 (YYYY-MM-DD)")
 @click.option("--budget", default=10000, type=int, help="予算(円)")
 @click.option("--coverage", default=0.9, type=float, help="レッグごとの累積確率絞り込み閾値 (0-1)")
-@click.option("--mode", type=click.Choice(["hit"]), default="hit", help="最適化モード (v1はhitのみ)")
+@click.option("--mode", type=click.Choice(["hit", "ev"]), default="hit", help="最適化モード")
+@click.option("--carryover", default=0, type=int, help="(EVモード) キャリーオーバー(円)")
+@click.option("--total-sales-est", "total_sales_est", default=300_000_000, type=int,
+              help="(EVモード) 想定発売金額(円)。デフォルト 3億円")
+@click.option("--min-ev", default=0.0, type=float, help="(EVモード) 採択する expected_value の下限")
 @click.option("--dry-run", is_flag=True, help="DB保存せず表示のみ")
-def predict_win5(target_date: str | None, budget: int, coverage: float, mode: str, dry_run: bool):
-    """WIN5 推奨買い目を生成 (hit-only v1)
+def predict_win5(
+    target_date: str | None, budget: int, coverage: float, mode: str,
+    carryover: int, total_sales_est: int, min_ev: float, dry_run: bool,
+):
+    """WIN5 推奨買い目を生成
 
-    Win5TargetRace (JRA公式で取得済み) と KeibaPredictor.predict() を組み合わせ、
-    各レッグ累積確率 coverage 以上で絞り込み → 直積 → 確率積降順 → 予算内top-N を返す。
+    mode=hit: 確率積 (各レース top-1 ベース) 降順で予算内 top-N
+    mode=ev:  想定払戻 × モデル勝率 = 期待値 降順で予算内 top-N (配当モデル v1)
+
+    EVモード注意:
+      - 市場暗黙確率と実際のWIN5票数は乖離あり → v1 は近似
+      - 制度変更 2026-04-25 以降のデータ蓄積まで「参考値」扱い推奨
+      - 資金管理はフラクショナルケリー等の分散抑制を前提に
 
     前提: scrape-win5-targets --date で対象5R を取得済みで、
     5R が Race テーブルにスクレイプ済み (race_id 解決済み) であること。
     """
-    from src.predictor.win5 import Win5Optimizer, build_win5_race_inputs
+    from src.predictor.win5 import (
+        Win5Optimizer, build_win5_market_inputs, build_win5_race_inputs,
+    )
 
     if target_date is None:
         target_date = date.today().isoformat()
@@ -597,6 +691,23 @@ def predict_win5(target_date: str | None, budget: int, coverage: float, mode: st
             predictions_by_race, prob_key="raw_win_prob",
         )
 
+        market_probs = None
+        if mode == "ev":
+            market_probs = build_win5_market_inputs(predictions_by_race)
+            # オッズ欠損チェック
+            for i, mp in enumerate(market_probs):
+                if mp.sum() <= 0:
+                    console.print(
+                        f"[red]leg{i+1}: オッズ情報が取得できていません (mode=ev には必須)[/red]"
+                    )
+                    console.print(f"[dim]`scrape --date {target_date} --with-odds` が必要[/dim]")
+                    return
+
+            console.print(
+                "[yellow]⚠ EVモードは配当モデル v1 (市場暗黙確率近似) の参考値です。\n"
+                "  制度変更 2026-04-25 以降のデータ蓄積まで実購入判断には使用しないでください。[/yellow]\n"
+            )
+
         optimizer = Win5Optimizer()
         rec = optimizer.generate_tickets(
             race_probs=race_probs,
@@ -604,6 +715,10 @@ def predict_win5(target_date: str | None, budget: int, coverage: float, mode: st
             budget=budget,
             coverage_threshold=coverage,
             mode=mode,
+            market_probs=market_probs,
+            total_sales_est=total_sales_est if mode == "ev" else None,
+            carryover=carryover,
+            min_ev=min_ev,
         )
 
         # --- 表示 ---
@@ -643,6 +758,16 @@ def predict_win5(target_date: str | None, budget: int, coverage: float, mode: st
         )
         console.print(f"想定hit率 (買った全点の確率和): {rec.hit_probability_sum:.4%}")
         console.print(f"最高確度1点: {rec.top_ticket_probability:.4%}")
+        if mode == "ev":
+            console.print(
+                f"配当モデル: total_sales_est={total_sales_est:,}円, "
+                f"carryover={carryover:,}円, min_ev={min_ev}"
+            )
+            n_above = rec.meta.get("n_combinations_above_min_ev", 0)
+            console.print(f"min_ev を満たす組合せ数: {n_above}")
+            if "top_expected_value" in rec.meta:
+                console.print(f"最高 EV: {rec.meta['top_expected_value']:.3f} (>1 で期待値プラス)")
+                console.print(f"平均 EV: {rec.meta['mean_expected_value']:.3f}")
 
         # 上位チケット
         show_n = min(20, len(rec.tickets))
@@ -650,13 +775,24 @@ def predict_win5(target_date: str | None, budget: int, coverage: float, mode: st
             t_table = Table(title=f"推奨チケット (上位 {show_n}/{len(rec.tickets)}点)")
             t_table.add_column("#", justify="right")
             t_table.add_column("組合せ (leg1-2-3-4-5)")
-            t_table.add_column("確率", justify="right")
+            t_table.add_column("勝率積", justify="right")
+            if mode == "ev":
+                t_table.add_column("市場確率積", justify="right")
+                t_table.add_column("想定払戻", justify="right")
+                t_table.add_column("EV", justify="right")
             for idx, ticket in enumerate(rec.tickets[:show_n], start=1):
-                t_table.add_row(
+                row = [
                     str(idx),
                     ticket.combination_key,
                     f"{ticket.combo_probability:.4%}",
-                )
+                ]
+                if mode == "ev":
+                    row.extend([
+                        f"{(ticket.combo_market_probability or 0):.4%}",
+                        f"{(ticket.expected_payout or 0):,.0f}円",
+                        f"{(ticket.expected_value or 0):.3f}",
+                    ])
+                t_table.add_row(*row)
             console.print(t_table)
 
         # 保存
