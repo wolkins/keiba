@@ -1,4 +1,5 @@
 """スクレイピングデータをDBに格納するパーサー (中央競馬)"""
+import json
 from datetime import datetime
 
 from sqlalchemy import and_, func
@@ -6,7 +7,9 @@ from sqlalchemy.orm import Session
 
 from src.common.database import (
     Horse, Jockey, Odds, OddsSnapshot, Race, RaceEntry, Racecourse,
-    Win5TargetRace, WIN5_TARGET_SOURCE_JRA, WIN5_TARGET_STATUS_SCHEDULED,
+    Win5Run, Win5TargetRace,
+    WIN5_OPTIMIZER_VERSION, WIN5_RUN_MODE_HIT, WIN5_TARGET_SOURCE_JRA,
+    WIN5_TARGET_STATUS_SCHEDULED, WIN5_UNIT_PRICE,
     get_session,
 )
 
@@ -371,6 +374,72 @@ def resolve_win5_race_links(session: Session, race_date) -> int:
     if resolved:
         session.commit()
     return resolved
+
+
+def store_win5_run(
+    session: Session,
+    race_date,
+    recommendation,
+    target_races: list[Win5TargetRace],
+    as_of: datetime | None = None,
+) -> Win5Run:
+    """WIN5 推奨買い目を Win5Run として保存 (append-only)
+
+    Args:
+        session: DBセッション
+        race_date: date
+        recommendation: Win5Recommendation
+        target_races: この run が参照した Win5TargetRace 5件
+        as_of: 実行時刻。None なら now()
+
+    Returns:
+        保存された Win5Run
+    """
+    if isinstance(race_date, str):
+        race_date = datetime.strptime(race_date, "%Y-%m-%d").date()
+    if as_of is None:
+        as_of = datetime.now()
+
+    tickets_json = json.dumps([
+        {
+            "horse_numbers": t.horse_numbers,
+            "combination_key": t.combination_key,
+            "prob": t.combo_probability,
+            "amount": t.amount,
+        }
+        for t in recommendation.tickets
+    ], ensure_ascii=False)
+
+    target_races_json = json.dumps([
+        {
+            "leg_index": t.leg_index,
+            "racecourse_code": t.racecourse_code,
+            "racecourse_name": t.racecourse_name,
+            "race_number": t.race_number,
+            "race_id": t.race_id,
+            "post_time": t.post_time,
+        }
+        for t in sorted(target_races, key=lambda x: x.leg_index)
+    ], ensure_ascii=False)
+
+    run = Win5Run(
+        race_date=race_date,
+        as_of=as_of,
+        mode=recommendation.mode,
+        budget=recommendation.budget,
+        unit_amount=recommendation.unit_amount,
+        total_tickets=recommendation.total_tickets,
+        total_cost=recommendation.total_cost,
+        hit_probability_sum=recommendation.hit_probability_sum,
+        top_ticket_probability=recommendation.top_ticket_probability,
+        coverage_threshold=recommendation.coverage_threshold,
+        optimizer_version=WIN5_OPTIMIZER_VERSION,
+        tickets_json=tickets_json,
+        target_races_json=target_races_json,
+    )
+    session.add(run)
+    session.commit()
+    return run
 
 
 def get_odds_snapshot(

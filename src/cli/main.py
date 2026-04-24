@@ -17,11 +17,12 @@ from rich.panel import Panel
 from rich.table import Table
 
 from src.common.database import (
-    Race, RaceEntry, Racecourse, Win5TargetRace,
+    Race, RaceEntry, Racecourse, Win5Run, Win5TargetRace,
     get_session, init_db, seed_racecourses,
 )
 from src.parser.store import (
-    resolve_win5_race_links, store_odds, store_race_result, store_win5_target_races,
+    resolve_win5_race_links, store_odds, store_race_result,
+    store_win5_run, store_win5_target_races,
 )
 from src.predictor.model import KeibaPredictor
 from src.scraper.jra_win5 import Win5Scraper
@@ -527,6 +528,145 @@ def status():
     console.print(table)
     console.print()
     session.close()
+
+
+@cli.command("predict-win5")
+@click.option("--date", "target_date", default=None, help="対象日 (YYYY-MM-DD)")
+@click.option("--budget", default=10000, type=int, help="予算(円)")
+@click.option("--coverage", default=0.9, type=float, help="レッグごとの累積確率絞り込み閾値 (0-1)")
+@click.option("--mode", type=click.Choice(["hit"]), default="hit", help="最適化モード (v1はhitのみ)")
+@click.option("--dry-run", is_flag=True, help="DB保存せず表示のみ")
+def predict_win5(target_date: str | None, budget: int, coverage: float, mode: str, dry_run: bool):
+    """WIN5 推奨買い目を生成 (hit-only v1)
+
+    Win5TargetRace (JRA公式で取得済み) と KeibaPredictor.predict() を組み合わせ、
+    各レッグ累積確率 coverage 以上で絞り込み → 直積 → 確率積降順 → 予算内top-N を返す。
+
+    前提: scrape-win5-targets --date で対象5R を取得済みで、
+    5R が Race テーブルにスクレイプ済み (race_id 解決済み) であること。
+    """
+    from src.predictor.win5 import Win5Optimizer, build_win5_race_inputs
+
+    if target_date is None:
+        target_date = date.today().isoformat()
+
+    session = get_session()
+    try:
+        dt = datetime.strptime(target_date, "%Y-%m-%d").date()
+
+        # Win5TargetRace を読み込み
+        targets = (
+            session.query(Win5TargetRace)
+            .filter(Win5TargetRace.race_date == dt)
+            .order_by(Win5TargetRace.leg_index)
+            .all()
+        )
+        if len(targets) != 5:
+            console.print(f"[red]WIN5対象5Rが DB に揃っていません ({len(targets)}/5)[/red]")
+            console.print(f"[dim]先に `scrape-win5-targets --date {target_date}` を実行してください[/dim]")
+            return
+
+        unresolved = [t for t in targets if t.race_id is None]
+        if unresolved:
+            console.print(
+                f"[red]{len(unresolved)}件の Win5TargetRace が Race 未連携です。[/red]"
+            )
+            console.print(
+                f"[dim]先に `scrape --date {target_date}` → "
+                f"`inspect-win5-targets --date {target_date} --resolve` を実行してください[/dim]"
+            )
+            return
+
+        # 各レースの予測を取得
+        predictor = KeibaPredictor(mode="accuracy")
+        predictions_by_race = []
+        for t in targets:
+            race = session.query(Race).filter_by(id=t.race_id).first()
+            if not race:
+                console.print(f"[red]leg{t.leg_index}: race_id={t.race_id} が見つかりません[/red]")
+                return
+            preds = predictor.predict(session, race)
+            if not preds:
+                console.print(
+                    f"[red]leg{t.leg_index}: {t.racecourse_name} {t.race_number}R 予測不可[/red]"
+                )
+                return
+            predictions_by_race.append(preds)
+
+        race_probs, horse_numbers = build_win5_race_inputs(
+            predictions_by_race, prob_key="raw_win_prob",
+        )
+
+        optimizer = Win5Optimizer()
+        rec = optimizer.generate_tickets(
+            race_probs=race_probs,
+            horse_numbers=horse_numbers,
+            budget=budget,
+            coverage_threshold=coverage,
+            mode=mode,
+        )
+
+        # --- 表示 ---
+        console.print(f"\n[bold blue]WIN5 推奨買い目 ({target_date}, mode={mode}, budget={budget:,}円)[/bold blue]\n")
+
+        # 対象5R & 採用馬
+        pred_by_leg = {t.leg_index: predictions_by_race[i] for i, t in enumerate(targets)}
+        legs_table = Table(title="レッグ別採用馬")
+        legs_table.add_column("leg", justify="right")
+        legs_table.add_column("競馬場")
+        legs_table.add_column("R", justify="right")
+        legs_table.add_column("採用馬 (馬番:確率)")
+        legs_table.add_column("頭数", justify="right")
+        for i, t in enumerate(targets):
+            horses = rec.selected_horses_by_leg[i]
+            probs = rec.selected_probs_by_leg[i]
+            preds = pred_by_leg[t.leg_index]
+            name_map = {int(p["horse_number"]): p.get("horse_name", "") for p in preds}
+            horse_strs = [
+                f"{h}({name_map.get(h, '?')}:{p:.2f})"
+                for h, p in zip(horses, probs)
+            ]
+            legs_table.add_row(
+                str(t.leg_index),
+                t.racecourse_name,
+                str(t.race_number),
+                ", ".join(horse_strs),
+                str(len(horses)),
+            )
+        console.print(legs_table)
+
+        # サマリ
+        n_evaluated = rec.meta.get("n_combinations_evaluated", 0)
+        console.print(
+            f"\n買い目: {rec.total_tickets}点 / 総額 {rec.total_cost:,}円"
+            f" (評価組合せ数 {n_evaluated}, coverage={coverage:.0%})"
+        )
+        console.print(f"想定hit率 (買った全点の確率和): {rec.hit_probability_sum:.4%}")
+        console.print(f"最高確度1点: {rec.top_ticket_probability:.4%}")
+
+        # 上位チケット
+        show_n = min(20, len(rec.tickets))
+        if show_n > 0:
+            t_table = Table(title=f"推奨チケット (上位 {show_n}/{len(rec.tickets)}点)")
+            t_table.add_column("#", justify="right")
+            t_table.add_column("組合せ (leg1-2-3-4-5)")
+            t_table.add_column("確率", justify="right")
+            for idx, ticket in enumerate(rec.tickets[:show_n], start=1):
+                t_table.add_row(
+                    str(idx),
+                    ticket.combination_key,
+                    f"{ticket.combo_probability:.4%}",
+                )
+            console.print(t_table)
+
+        # 保存
+        if dry_run:
+            console.print("\n[dim](dry-run: DB保存をスキップしました)[/dim]")
+        else:
+            run = store_win5_run(session, dt, rec, targets)
+            console.print(f"\n[green]Win5Run id={run.id} に保存しました[/green]")
+    finally:
+        session.close()
 
 
 @cli.command("evaluate-win5")

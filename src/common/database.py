@@ -208,6 +208,41 @@ class Win5TargetRace(Base):
     )
 
 
+WIN5_RUN_MODE_HIT = "hit"
+WIN5_OPTIMIZER_VERSION = "v1"
+WIN5_UNIT_PRICE = 200
+
+
+class Win5Run(Base):
+    """WIN5 推奨買い目 (1回の最適化実行単位)
+
+    チケット詳細と対象5Rスナップショットは tickets_json / target_races_json に
+    JSON で保持する (正規化はしない: チケット数は最大で budget//200 程度で
+    行数が爆発するリスクがある + 参照は run 単位が支配的)。
+    """
+    __tablename__ = "win5_runs"
+
+    id = Column(Integer, primary_key=True)
+    race_date = Column(Date, nullable=False, index=True)
+    as_of = Column(DateTime, nullable=False, default=datetime.now)
+
+    mode = Column(String(20), nullable=False, default=WIN5_RUN_MODE_HIT)
+    budget = Column(Integer, nullable=False)
+    unit_amount = Column(Integer, nullable=False, default=WIN5_UNIT_PRICE)
+    total_tickets = Column(Integer, nullable=False)
+    total_cost = Column(Integer, nullable=False)
+
+    hit_probability_sum = Column(Float, nullable=True)       # 買った全点の的中確率の和 (= 想定hit rate)
+    top_ticket_probability = Column(Float, nullable=True)    # 最も確度の高い1点の確率
+    coverage_threshold = Column(Float, nullable=True)        # 候補絞り込みの累積確率閾値
+    optimizer_version = Column(String(20), nullable=False, default=WIN5_OPTIMIZER_VERSION)
+
+    tickets_json = Column(Text, nullable=False)              # list[{horse_numbers, prob, amount}]
+    target_races_json = Column(Text, nullable=False)         # list[{leg_index, racecourse_code, race_number, race_id}]
+
+    created_at = Column(DateTime, default=datetime.now)
+
+
 class PredictionResult(Base):
     """予想結果の記録"""
     __tablename__ = "prediction_results"
