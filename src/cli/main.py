@@ -17,7 +17,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from src.common.database import Race, RaceEntry, Racecourse, get_session, init_db, seed_racecourses
-from src.parser.store import store_race_result
+from src.parser.store import store_odds, store_race_result
 from src.predictor.model import KeibaPredictor
 from src.scraper.netkeiba import NetkeibaScraper
 
@@ -81,7 +81,13 @@ def scrape(target_date: str | None, with_odds: bool):
                     race = store_race_result(session, race_id, result)
                     n_entries = len(result.get("entries", []))
                     label = "出走表" if use_shutuba else "結果"
-                    console.print(f"    → [green]{label}: {n_entries}頭[/green]")
+                    odds_msg = ""
+                    if with_odds and race:
+                        odds_list = scraper.scrape_odds(race_id)
+                        if odds_list:
+                            store_odds(session, race, odds_list)
+                            odds_msg = f" / オッズ{len(odds_list)}件"
+                    console.print(f"    → [green]{label}: {n_entries}頭{odds_msg}[/green]")
                 else:
                     console.print(f"    → [yellow]データなし[/yellow]")
 
@@ -98,7 +104,8 @@ def scrape(target_date: str | None, with_odds: bool):
 @click.option("--from", "date_from", required=True, help="開始日 (YYYY-MM-DD)")
 @click.option("--to", "date_to", default=None, help="終了日 (YYYY-MM-DD)")
 @click.option("--force", is_flag=True, default=False, help="既存データがあっても再取得する")
-def scrape_range(date_from: str, date_to: str | None, force: bool):
+@click.option("--with-odds", "with_odds", is_flag=True, default=False, help="単勝オッズも取得する")
+def scrape_range(date_from: str, date_to: str | None, force: bool, with_odds: bool):
     """期間指定で一括データ取得"""
     import time as time_mod
 
@@ -156,8 +163,12 @@ def scrape_range(date_from: str, date_to: str | None, force: bool):
                         result = scraper.scrape_race_result(race_id)
                         if result:
                             result["race_date"] = current_str
-                            store_race_result(session, race_id, result)
+                            race = store_race_result(session, race_id, result)
                             day_entries += len(result.get("entries", []))
+                            if with_odds and race:
+                                odds_list = scraper.scrape_odds(race_id)
+                                if odds_list:
+                                    store_odds(session, race, odds_list)
                     except Exception as e:
                         session.rollback()
                         console.print(f"  [red]{race_id}: {e}[/red]")

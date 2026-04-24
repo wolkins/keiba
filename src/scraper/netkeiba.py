@@ -583,6 +583,56 @@ class NetkeibaScraper:
 
         return entry
 
+    # ------------------------------------------------------------------
+    # オッズ (race.netkeiba.com)
+    # ------------------------------------------------------------------
+    def scrape_odds(self, race_id: str) -> list[dict]:
+        """単勝・複勝オッズを取得
+
+        Returns:
+            [{"bet_type": "win", "combination": "1", "odds_value": 3.5}, ...]
+        """
+        url = f"{RACE_URL}/odds/index.html?race_id={race_id}&type=b1"
+        try:
+            soup = self._get(url, encoding="UTF-8")
+        except Exception:
+            return []
+
+        odds_list = []
+
+        # 単勝オッズテーブル
+        for row in soup.select("tr.Odds_Table_Row, table#odds_tan_block tr"):
+            cells = row.find_all("td")
+            if len(cells) < 2:
+                continue
+            texts = [c.get_text(strip=True) for c in cells]
+            # 馬番と単勝オッズを探す
+            num = None
+            for t in texts:
+                if t.isdigit() and num is None:
+                    num = t
+            for t in texts:
+                try:
+                    v = float(t)
+                    if num and 1.0 <= v <= 9999.9:
+                        odds_list.append({"bet_type": "win", "combination": num, "odds_value": v})
+                        break
+                except ValueError:
+                    pass
+
+        # 取得できなければ結果ページの単勝オッズを使う
+        if not odds_list:
+            result = self.scrape_race_result(race_id)
+            for e in result.get("entries", []):
+                if e.get("odds_win") and e.get("horse_number"):
+                    odds_list.append({
+                        "bet_type": "win",
+                        "combination": str(e["horse_number"]),
+                        "odds_value": e["odds_win"],
+                    })
+
+        return odds_list
+
     def _parse_horse_weight(self, text: str, entry: dict):
         """馬体重テキストをパース: "480(+2)", "480(-4)", "480(0)", "計不" """
         m = re.match(r"(\d+)\(([+\-]?\d+)\)", text)

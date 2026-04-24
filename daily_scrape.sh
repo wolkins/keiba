@@ -3,4 +3,4 @@
 cd "$(dirname "$0")"
 YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
 source .venv/bin/activate
-python -m src.cli scrape --date "$YESTERDAY" >> logs/daily_scrape.log 2>&1
+python -m src.cli scrape --date "$YESTERDAY" --with-odds >> logs/daily_scrape.log 2>&1
