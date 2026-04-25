@@ -769,10 +769,85 @@ def predict_win5(
                 console.print(f"最高 EV: {rec.meta['top_expected_value']:.3f} (>1 で期待値プラス)")
                 console.print(f"平均 EV: {rec.meta['mean_expected_value']:.3f}")
 
-        # 上位チケット
+        # --- フォーメーション購入ガイド ---
+        # 採択チケット中に各馬が何回出現したかを集計して、フォーメーションとして買える形を出す
+        leg_horse_counts = [{} for _ in range(5)]
+        for ticket in rec.tickets:
+            for leg_idx, hnum in enumerate(ticket.horse_numbers):
+                leg_horse_counts[leg_idx][hnum] = leg_horse_counts[leg_idx].get(hnum, 0) + 1
+
+        formation_horses: list[list[int]] = []
+        formation_sizes: list[int] = []
+        for leg_idx in range(5):
+            horses_in_tickets = sorted(leg_horse_counts[leg_idx].keys())
+            formation_horses.append(horses_in_tickets)
+            formation_sizes.append(len(horses_in_tickets))
+
+        formation_product = 1
+        for s in formation_sizes:
+            formation_product *= s
+
+        formation_cost = formation_product * rec.unit_amount
+        is_full_formation = (formation_product == rec.total_tickets)
+
+        console.print("\n[bold cyan]━━━ 購入ガイド ━━━[/bold cyan]")
+        fg_table = Table(show_header=True, header_style="bold")
+        fg_table.add_column("leg", justify="right")
+        fg_table.add_column("競馬場")
+        fg_table.add_column("R", justify="right")
+        fg_table.add_column("買う馬 (馬番)", overflow="fold")
+        fg_table.add_column("点数", justify="right")
+        name_by_leg = {t.leg_index: {int(p["horse_number"]): p.get("horse_name", "") for p in predictions_by_race[i]}
+                       for i, t in enumerate(targets)}
+        for i, t in enumerate(targets):
+            horses = formation_horses[i]
+            name_map = name_by_leg[t.leg_index]
+            horse_strs = [f"{h}({name_map.get(h, '?')})" for h in horses]
+            fg_table.add_row(
+                str(t.leg_index),
+                t.racecourse_name,
+                str(t.race_number),
+                ", ".join(horse_strs) if horse_strs else "-",
+                str(len(horses)),
+            )
+        console.print(fg_table)
+
+        total_points_str = " × ".join(str(s) for s in formation_sizes)
+        if is_full_formation:
+            console.print(
+                f"\n[bold green]→ フォーメーション買い: {total_points_str} = "
+                f"{formation_product}点 × {rec.unit_amount}円 = {formation_cost:,}円[/bold green]"
+            )
+            console.print("[dim]  JRA IPAT / マークシートで「フォーメーション」を選んで上記馬を指定するだけで OK[/dim]")
+        else:
+            console.print(
+                f"\n[yellow]→ 部分フォーメーション: フォーメーション {total_points_str} = "
+                f"{formation_product}点 のうち上位 {rec.total_tickets}点のみ採用[/yellow]"
+            )
+            console.print(
+                "[dim]  フォーメーション買いだと余分な組合せが含まれるため、IPAT の個別入力か\n"
+                "  --coverage を下げて部分フォーメーションの「抜け」を無くす必要あり[/dim]"
+            )
+
+        # 軸馬 (全チケットに登場している馬) を特定
+        axis_by_leg = []
+        for leg_idx in range(5):
+            axis = [h for h, c in leg_horse_counts[leg_idx].items() if c == rec.total_tickets]
+            axis_by_leg.append(axis)
+        if any(axis_by_leg):
+            axis_str = " / ".join(
+                f"leg{i+1}: {','.join(str(h) for h in sorted(axis))}"
+                for i, axis in enumerate(axis_by_leg) if axis
+            )
+            console.print(f"[dim]  軸馬 (全点で共通): {axis_str}[/dim]")
+
+        # --- チケット詳細 (参考) ---
         show_n = min(20, len(rec.tickets))
         if show_n > 0:
-            t_table = Table(title=f"推奨チケット (上位 {show_n}/{len(rec.tickets)}点)")
+            console.print(
+                f"\n[dim]── 内訳 (確率/EV 降順, 上位 {show_n}/{len(rec.tickets)}点, 参考表示) ──[/dim]"
+            )
+            t_table = Table(show_header=True, header_style="bold")
             t_table.add_column("#", justify="right")
             t_table.add_column("組合せ (leg1-2-3-4-5)")
             t_table.add_column("勝率積", justify="right")
@@ -784,11 +859,11 @@ def predict_win5(
                 row = [
                     str(idx),
                     ticket.combination_key,
-                    f"{ticket.combo_probability:.4%}",
+                    f"{ticket.combo_probability * 100:.5f}%",
                 ]
                 if mode == "ev":
                     row.extend([
-                        f"{(ticket.combo_market_probability or 0):.4%}",
+                        f"{(ticket.combo_market_probability or 0) * 100:.5f}%",
                         f"{(ticket.expected_payout or 0):,.0f}円",
                         f"{(ticket.expected_value or 0):.3f}",
                     ])
